@@ -1,9 +1,9 @@
 import os
-import json
 import time
 import logging
 from flask import Flask, request, jsonify
 import httpx
+from supabase import create_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("polkovnik-manager")
@@ -12,32 +12,67 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
-SETTINGS_FILE = "/tmp/polkovnik_settings.json"
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 
-state = {
-    "owner_user_id": None,
-    "away_mode": False,
-    "timer_until": None,
-    "away_text": "Привет! Я сейчас не у телефона, отвечу, как только смогу.",
-    "custom_texts": {}
-}
+if not SUPABASE_URL or not SUPABASE_KEY:
+    log.warning("SUPABASE_URL or SUPABASE_KEY is missing")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+state = {"owner_user_id": None, "away_mode": False, "timer_until": None, "away_text": "Привет! Я сейчас не у телефона, отвечу, как только смогу."}
 
 
 def load_state():
     global state
+    if not supabase:
+        return
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            state.update(json.load(f))
+        row = supabase.table("manager_state").select("*").eq("id", 1).single().execute().data
+        if row:
+            state["owner_user_id"] = row.get("owner_user_id")
+            state["away_mode"] = bool(row.get("away_mode", False))
+            state["away_text"] = row.get("away_text") or state["away_text"]
+            timer = row.get("timer_until")
+            if timer:
+                from datetime import datetime, timezone
+                state["timer_until"] = datetime.fromisoformat(timer.replace("Z", "+00:00")).timestamp()
     except Exception:
-        pass
+        log.exception("Could not load state")
 
 
 def save_state():
+    if not supabase:
+        return
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
+        from datetime import datetime, timezone
+        timer = datetime.fromtimestamp(state["timer_until"], timezone.utc).isoformat() if state.get("timer_until") else None
+        supabase.table("manager_state").update({
+            "owner_user_id": state.get("owner_user_id"),
+            "away_mode": bool(state.get("away_mode")),
+            "away_text": state.get("away_text"),
+            "timer_until": timer,
+        }).eq("id", 1).execute()
     except Exception:
         log.exception("Could not save state")
+
+
+def get_custom_texts():
+    if not supabase:
+        return {}
+    try:
+        rows = supabase.table("custom_replies").select("chat_id,reply_text").execute().data or []
+        return {str(row["chat_id"]): row["reply_text"] for row in rows}
+    except Exception:
+        log.exception("Could not load custom replies")
+        return {}
+
+
+def set_custom_text(chat_id, text):
+    supabase.table("custom_replies").upsert({"chat_id": int(chat_id), "reply_text": text}).execute()
+
+
+def delete_custom_text(chat_id):
+    supabase.table("custom_replies").delete().eq("chat_id", int(chat_id)).execute()
 
 
 def timer_active():
@@ -109,10 +144,7 @@ def timer_menu():
 def setup_webhook():
     if not BOT_TOKEN or not PUBLIC_URL:
         return
-    payload = {
-        "url": f"{PUBLIC_URL}/telegram/webhook",
-        "allowed_updates": ["message", "callback_query", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"]
-    }
+    payload = {"url": f"{PUBLIC_URL}/telegram/webhook", "allowed_updates": ["message", "callback_query", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"]}
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
     tg("setWebhook", payload)
@@ -127,7 +159,6 @@ def health():
 def webhook():
     if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
         return jsonify({"ok": False}), 403
-
     update = request.get_json(silent=True) or {}
     log.info("Update received: %s", update)
 
@@ -141,71 +172,38 @@ def webhook():
         sender_id = (msg.get("from") or {}).get("id")
         chat_id = (msg.get("chat") or {}).get("id")
         text = (msg.get("text") or "").strip()
-
         if chat_id and sender_id and text == "/start" and state["owner_user_id"] is None:
             state["owner_user_id"] = sender_id
             save_state()
             bot_msg(chat_id, "⚙️ Polkovnik Manager\n\nТы назначен владельцем. Управление автоответчиком:", menu())
-
         elif chat_id and sender_id == state["owner_user_id"] and text:
+            custom = get_custom_texts()
             if text == "/start":
-                bot_msg(chat_id, "⚙️ Polkovnik Manager\n\nУправление автоответчиком:", menu())
+                bot_msg(chat_id, "⚙️ Polkovник Manager\n\nУправление автоответчиком:", menu())
             elif text == "/on":
-                state["away_mode"] = True
-                state["timer_until"] = None
-                save_state()
-                bot_msg(chat_id, "🟢 Автоответчик включён без таймера.", menu())
+                state.update({"away_mode": True, "timer_until": None}); save_state(); bot_msg(chat_id, "🟢 Автоответчик включён без таймера.", menu())
             elif text == "/off":
-                state["away_mode"] = False
-                state["timer_until"] = None
-                save_state()
-                bot_msg(chat_id, "🔴 Автоответчик выключен.", menu())
+                state.update({"away_mode": False, "timer_until": None}); save_state(); bot_msg(chat_id, "🔴 Автоответчик выключен.", menu())
             elif text.startswith("/timer"):
                 parts = text.split(maxsplit=1)
-                if len(parts) == 1:
-                    bot_msg(chat_id, f"⏱ Таймер: {timer_label()}", timer_menu())
+                if len(parts) == 1: bot_msg(chat_id, f"⏱ Таймер: {timer_label()}", timer_menu())
                 else:
                     duration = parse_duration(parts[1])
-                    if duration is None:
-                        bot_msg(chat_id, "Формат: /timer 30m, /timer 2h или /timer 1h30m", timer_menu())
-                    elif duration <= 0:
-                        state["away_mode"] = False; state["timer_until"] = None; save_state()
-                        bot_msg(chat_id, "🔴 Автоответчик выключен.", menu())
-                    else:
-                        state["away_mode"] = True
-                        state["timer_until"] = time.time() + duration
-                        save_state()
-                        bot_msg(chat_id, f"⏱ Автоответчик включён на {format_duration(duration)}.", menu())
+                    if duration is None: bot_msg(chat_id, "Формат: /timer 30m, /timer 2h или /timer 1h30m", timer_menu())
+                    else: state.update({"away_mode": True, "timer_until": time.time() + duration}); save_state(); bot_msg(chat_id, f"⏱ Автоответчик включён на {format_duration(duration)}.", menu())
             elif text == "/status":
-                active = timer_active()
-                bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if active else '🔴 выключен'}\nТаймер: {timer_label()}\nПерсональных ответов: {len(state['custom_texts'])}\n\nСтандартный:\n{state['away_text']}", menu())
+                bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nПерсональных ответов: {len(custom)}\n\nСтандартный:\n{state['away_text']}", menu())
             elif text == "/list":
-                items = state["custom_texts"]
-                bot_msg(chat_id, "📋 Персональных ответов нет." if not items else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k, v in items.items()), menu())
-            elif text == "/text":
-                bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\nЧтобы изменить, отправь:\n/text Новый текст", menu())
+                bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k,v in custom.items()), menu())
+            elif text == "/text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\n/text Новый текст", menu())
             elif text.startswith("/text "):
-                new_text = text[6:].strip()
-                if new_text:
-                    state["away_text"] = new_text
-                    save_state()
-                    bot_msg(chat_id, "✅ Стандартный текст сохранён.", menu())
+                state["away_text"] = text[6:].strip(); save_state(); bot_msg(chat_id, "✅ Стандартный текст сохранён.", menu())
             elif text.startswith("/set "):
                 parts = text[5:].strip().split(maxsplit=1)
-                if len(parts) == 2 and parts[0].lstrip("-").isdigit():
-                    state["custom_texts"][parts[0]] = parts[1]
-                    save_state()
-                    bot_msg(chat_id, "✅ Персональный ответ сохранён.", menu())
-                else:
-                    bot_msg(chat_id, "Формат:\n/set ID текст\n\nНапример:\n/set 123456789 Я отвечу вечером.", menu())
+                if len(parts) == 2 and parts[0].lstrip("-").isdigit(): set_custom_text(parts[0], parts[1]); bot_msg(chat_id, "✅ Персональный ответ сохранён.", menu())
+                else: bot_msg(chat_id, "Формат: /set ID текст", menu())
             elif text.startswith("/del "):
-                target = text[5:].strip()
-                if target in state["custom_texts"]:
-                    del state["custom_texts"][target]
-                    save_state()
-                    bot_msg(chat_id, "✅ Персональный ответ удалён.", menu())
-                else:
-                    bot_msg(chat_id, "Такого персонального ответа нет.", menu())
+                target = text[5:].strip(); delete_custom_text(target); bot_msg(chat_id, "✅ Персональный ответ удалён.", menu())
 
     cb = update.get("callback_query")
     if cb:
@@ -214,68 +212,42 @@ def webhook():
         data = cb.get("data")
         if sender_id == state["owner_user_id"] and chat_id:
             tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
-            if data == "on":
-                state["away_mode"] = True; state["timer_until"] = None; save_state(); bot_msg(chat_id, "🟢 Автоответчик включён без таймера.", menu())
-            elif data == "off":
-                state["away_mode"] = False; state["timer_until"] = None; save_state(); bot_msg(chat_id, "🔴 Автоответчик выключен.", menu())
-            elif data == "timer":
-                bot_msg(chat_id, f"⏱ Таймер сейчас: {timer_label()}\n\nНа сколько включить автоответчик?", timer_menu())
+            if data == "on": state.update({"away_mode": True, "timer_until": None}); save_state(); bot_msg(chat_id, "🟢 Включено.", menu())
+            elif data == "off": state.update({"away_mode": False, "timer_until": None}); save_state(); bot_msg(chat_id, "🔴 Выключено.", menu())
+            elif data == "timer": bot_msg(chat_id, f"⏱ Таймер: {timer_label()}", timer_menu())
             elif data.startswith("t:"):
-                seconds = int(data.split(":", 1)[1])
-                if seconds == 0:
-                    state["away_mode"] = True; state["timer_until"] = None; save_state(); bot_msg(chat_id, "♾ Автоответчик включён без ограничения по времени.", menu())
-                else:
-                    state["away_mode"] = True; state["timer_until"] = time.time() + seconds; save_state(); bot_msg(chat_id, f"⏱ Автоответчик включён на {format_duration(seconds)}.", menu())
-            elif data == "back":
-                bot_msg(chat_id, "⚙️ Управление автоответчиком:", menu())
-            elif data == "status":
-                bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nПерсональных ответов: {len(state['custom_texts'])}", menu())
-            elif data == "text":
-                bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\nДля изменения:\n/text Новый текст", menu())
+                seconds = int(data.split(":",1)[1]); state["away_mode"] = True; state["timer_until"] = time.time()+seconds if seconds else None; save_state(); bot_msg(chat_id, "⏱ Таймер установлен.", menu())
+            elif data == "back": bot_msg(chat_id, "⚙️ Управление:", menu())
+            elif data == "status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nПерсональных ответов: {len(get_custom_texts())}", menu())
+            elif data == "text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\n/text Новый текст", menu())
             elif data == "list":
-                items = state["custom_texts"]
-                bot_msg(chat_id, "📋 Нет персональных ответов." if not items else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k, v in items.items()), menu())
-            elif data == "set_help":
-                bot_msg(chat_id, "👤 Настройка персонального ответа\n\nВ ЭТОМ чате отправь:\n/set ID текст\n\nНапример:\n/set 123456789 Не могу сейчас говорить, напишу позже.\n\nВ чат с человеком заходить не нужно.", menu())
+                custom = get_custom_texts(); bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n"+"\n\n".join(f"ID {k}: {v}" for k,v in custom.items()), menu())
+            elif data == "set_help": bot_msg(chat_id, "👤 Персональный ответ\n\nВ этом чате отправь:\n/set ID текст\n\nВ чат с человеком заходить не нужно.", menu())
 
     business = update.get("business_message")
     if business and timer_active():
         connection_id = business.get("business_connection_id")
         chat_id = (business.get("chat") or {}).get("id")
         if connection_id and chat_id and (business.get("text") or business.get("caption")):
-            reply = state["custom_texts"].get(str(chat_id), state["away_text"])
-            try:
-                business_msg(connection_id, chat_id, reply, business.get("message_id"))
-            except Exception:
-                log.exception("Failed to send business reply")
-
+            custom = get_custom_texts()
+            reply = custom.get(str(chat_id), state["away_text"])
+            try: business_msg(connection_id, chat_id, reply, business.get("message_id"))
+            except Exception: log.exception("Failed to send business reply")
     return jsonify({"ok": True})
 
 
 def parse_duration(value):
-    value = value.strip().lower().replace(" ", "")
-    if not value:
-        return None
-    total = 0
-    num = ""
-    units = {"m": 60, "h": 3600, "d": 86400}
+    value=value.strip().lower().replace(" ",""); total=0; num=""; units={"m":60,"h":3600,"d":86400}
     for ch in value:
-        if ch.isdigit():
-            num += ch
-        elif ch in units and num:
-            total += int(num) * units[ch]
-            num = ""
-        else:
-            return None
-    return total if not num and total > 0 else None
+        if ch.isdigit(): num+=ch
+        elif ch in units and num: total+=int(num)*units[ch]; num=""
+        else: return None
+    return total if not num and total>0 else None
 
 
 def format_duration(seconds):
-    seconds = int(seconds)
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes = rem // 60
-    parts = []
+    seconds=int(seconds); days,rem=divmod(seconds,86400); hours,rem=divmod(rem,3600); minutes=rem//60
+    parts=[]
     if days: parts.append(f"{days} д")
     if hours: parts.append(f"{hours} ч")
     if minutes: parts.append(f"{minutes} мин")
@@ -283,6 +255,4 @@ def format_duration(seconds):
 
 
 if __name__ == "__main__":
-    load_state()
-    setup_webhook()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    load_state(); setup_webhook(); app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
