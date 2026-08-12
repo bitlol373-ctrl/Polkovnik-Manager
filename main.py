@@ -73,7 +73,6 @@ def setup_webhook():
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
     tg("setWebhook", payload)
-    log.info("Webhook installed")
 
 
 @app.get("/")
@@ -93,15 +92,21 @@ def webhook():
         state["owner_user_id"] = connection["user"]["id"]
         save_state()
 
-    # Commands are accepted ONLY in the manager bot chat.
     msg = update.get("message")
     if msg:
         sender_id = (msg.get("from") or {}).get("id")
         chat_id = (msg.get("chat") or {}).get("id")
         text = (msg.get("text") or "").strip()
-        if chat_id and sender_id == state["owner_user_id"] and text:
+
+        # /start is allowed only when no owner has been registered yet.
+        # This fixes the first-run problem after a deploy. After that, only the owner can control the bot.
+        if chat_id and sender_id and text == "/start" and state["owner_user_id"] is None:
+            state["owner_user_id"] = sender_id
+            save_state()
+            bot_msg(chat_id, "⚙️ Polkovник Manager\n\nТы назначен владельцем. Управление автоответчиком:", menu())
+        elif chat_id and sender_id == state["owner_user_id"] and text:
             if text == "/start":
-                bot_msg(chat_id, "⚙️ Polkovnik Manager\n\nУправление автоответчиком:", menu())
+                bot_msg(chat_id, "⚙️ Polkovник Manager\n\nУправление автоответчиком:", menu())
             elif text == "/on":
                 state["away_mode"] = True; save_state(); bot_msg(chat_id, "🟢 Автоответчик включён.", menu())
             elif text == "/off":
@@ -110,8 +115,7 @@ def webhook():
                 bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if state['away_mode'] else '🔴 выключен'}\nПерсональных ответов: {len(state['custom_texts'])}\n\nСтандартный:\n{state['away_text']}", menu())
             elif text == "/list":
                 items = state["custom_texts"]
-                if not items: bot_msg(chat_id, "📋 Персональных ответов нет.", menu())
-                else: bot_msg(chat_id, "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k, v in items.items()), menu())
+                bot_msg(chat_id, "📋 Персональных ответов нет." if not items else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k, v in items.items()), menu())
             elif text == "/text":
                 bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\nЧтобы изменить, отправь:\n/text Новый текст", menu())
             elif text.startswith("/text "):
@@ -128,9 +132,9 @@ def webhook():
                 target = text[5:].strip()
                 if target in state["custom_texts"]:
                     del state["custom_texts"][target]; save_state(); bot_msg(chat_id, "✅ Персональный ответ удалён.", menu())
-                else: bot_msg(chat_id, "Такого персонального ответа нет.", menu())
+                else:
+                    bot_msg(chat_id, "Такого персонального ответа нет.", menu())
 
-    # Inline-button callbacks are also handled only in manager bot chat.
     cb = update.get("callback_query")
     if cb:
         sender_id = (cb.get("from") or {}).get("id")
@@ -146,7 +150,7 @@ def webhook():
                 items = state["custom_texts"]
                 bot_msg(chat_id, "📋 Нет персональных ответов." if not items else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k, v in items.items()), menu())
             elif data == "set_help":
-                bot_msg(chat_id, "👤 Настройка персонального ответа\n\nОтправь мне в ЭТОМ чате:\n/set ID текст\n\nНапример:\n/set 123456789 Не могу сейчас говорить, напишу позже.\n\nВ чат с человеком заходить не нужно.", menu())
+                bot_msg(chat_id, "👤 Настройка персонального ответа\n\nВ ЭТОМ чате отправь:\n/set ID текст\n\nНапример:\n/set 123456789 Не могу сейчас говорить, напишу позже.\n\nВ чат с человеком заходить не нужно.", menu())
 
     business = update.get("business_message")
     if business and state["away_mode"]:
