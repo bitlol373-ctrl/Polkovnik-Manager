@@ -267,7 +267,7 @@ def webhook():
         sender_id = (cb.get("from") or {}).get("id")
         chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
         data = cb.get("data")
-        if sender_id == state["owner_user_id"] and chat_id:
+        if str(sender_id) == str(state["owner_user_id"]) and chat_id:
             tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
             if data == "on": state.update({"away_mode": True, "timer_until": None}); save_state(); bot_msg(chat_id, "🟢 Включено.", menu())
             elif data == "off": state.update({"away_mode": False, "timer_until": None}); save_state(); bot_msg(chat_id, "🔴 Выключено.", menu())
@@ -285,10 +285,27 @@ def webhook():
     if business and timer_active():
         connection_id = business.get("business_connection_id")
         chat_id = (business.get("chat") or {}).get("id")
-        sender_id = (business.get("from") or {}).get("id")
+        sender = business.get("from") or {}
+        sender_id = sender.get("id")
+        sender_business_bot = business.get("sender_business_bot")
 
-        # Не отвечаем на собственные сообщения владельца Business-аккаунта.
-        if sender_id == state["owner_user_id"]:
+        # Telegram marks messages sent by a connected business bot with sender_business_bot.
+        # Also compare IDs as strings because Supabase/Telegram may return different numeric types.
+        is_owner_message = (
+            str(sender_id) == str(state.get("owner_user_id"))
+            or str((business.get("chat") or {}).get("id")) == str(state.get("owner_user_id"))
+            or sender.get("is_bot") is True
+            or sender_business_bot is not None
+        )
+
+        log.info(
+            "Business message: chat_id=%s sender_id=%s owner_id=%s sender_business_bot=%s is_owner=%s",
+            chat_id, sender_id, state.get("owner_user_id"),
+            sender_business_bot.get("id") if isinstance(sender_business_bot, dict) else sender_business_bot,
+            is_owner_message,
+        )
+
+        if is_owner_message:
             return jsonify({"ok": True})
 
         if connection_id and chat_id and (business.get("text") or business.get("caption")):
