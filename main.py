@@ -21,9 +21,9 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 state = {"owner_user_id": None, "away_mode": False, "timer_until": None, "away_text": "Привет! Я сейчас не у телефона, отвечу, как только смогу."}
 
-# Время последнего автоответа для каждого чата. Кулдаун — 5 минут.
+# Время последнего автоответа для каждого чата хранится в памяти.
+DEFAULT_REPLY_COOLDOWN = 5 * 60
 reply_cooldowns = {}
-REPLY_COOLDOWN = 5 * 60
 
 
 def load_state():
@@ -71,10 +71,38 @@ def get_custom_texts():
         return {}
     try:
         rows = supabase.table("custom_replies").select("chat_id,reply_text").execute().data or []
-        return {str(row["chat_id"]): row["reply_text"] for row in rows}
+        # chat_id=0 зарезервирован под настройку задержки и не является персональным ответом.
+        return {str(row["chat_id"]): row["reply_text"] for row in rows if str(row["chat_id"]) != "0"}
     except Exception as e:
         log.exception("SUPABASE READ ERROR (custom_replies): %s", e)
         return {}
+
+
+def get_reply_cooldown():
+    """Возвращает задержку между автоответами. Настройка хранится в custom_replies с chat_id=0."""
+    if not supabase:
+        return DEFAULT_REPLY_COOLDOWN
+    try:
+        row = supabase.table("custom_replies").select("reply_text").eq("chat_id", 0).limit(1).execute().data
+        if row:
+            value = int(row[0]["reply_text"])
+            if value >= 0:
+                return value
+    except Exception as e:
+        log.warning("Could not read reply cooldown, using default: %s", e)
+    return DEFAULT_REPLY_COOLDOWN
+
+
+def set_reply_cooldown(seconds):
+    if not supabase:
+        return False, "Supabase не подключён"
+    try:
+        supabase.table("custom_replies").upsert({"chat_id": 0, "reply_text": str(int(seconds))}).execute()
+        log.info("Reply cooldown saved: %ss", seconds)
+        return True, None
+    except Exception as e:
+        log.exception("SUPABASE WRITE ERROR (reply cooldown): %s", e)
+        return False, str(e)
 
 
 def set_custom_text(chat_id, text):
@@ -133,6 +161,8 @@ def parse_duration(value):
 
 
 def format_duration(seconds):
+    if seconds == 0:
+        return "без задержки"
     hours, rem = divmod(int(seconds), 3600)
     minutes = rem // 60
     if hours and minutes:
@@ -170,9 +200,22 @@ def menu():
     return {"inline_keyboard": [
         [{"text": "🟢 Включить", "callback_data": "on"}, {"text": "🔴 Выключить", "callback_data": "off"}],
         [{"text": "⏱ Таймер", "callback_data": "timer"}, {"text": "📊 Статус", "callback_data": "status"}],
+        [{"text": "⏳ Задержка ответов", "callback_data": "delay"}],
         [{"text": "📝 Стандартный текст", "callback_data": "text"}],
         [{"text": "👤 Персональный ответ", "callback_data": "set_help"}],
         [{"text": "📋 Персональные ответы", "callback_data": "list"}]
+    ]}
+
+
+def delay_menu():
+    current = get_reply_cooldown()
+    return {"inline_keyboard": [
+        [{"text": "Без задержки", "callback_data": "d:0"}],
+        [{"text": "1 минута", "callback_data": "d:60"}, {"text": "5 минут", "callback_data": "d:300"}],
+        [{"text": "10 минут", "callback_data": "d:600"}, {"text": "30 минут", "callback_data": "d:1800"}],
+        [{"text": "1 час", "callback_data": "d:3600"}],
+        [{"text": "✏️ Своя задержка", "callback_data": "d:help"}],
+        [{"text": "⬅️ Назад", "callback_data": "back"}]
     ]}
 
 
@@ -197,7 +240,7 @@ def setup_webhook():
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "Polkovnik Manager", "away_mode": timer_active(), "timer": timer_label()})
+    return jsonify({"ok": True, "service": "Polkovnik Manager", "away_mode": timer_active(), "timer": timer_label(), "reply_cooldown": get_reply_cooldown()})
 
 
 @app.post("/telegram/webhook")
@@ -236,8 +279,25 @@ def webhook():
                     duration = parse_duration(parts[1])
                     if duration is None: bot_msg(chat_id, "Формат: /timer 30m, /timer 2h или /timer 1h30m", timer_menu())
                     else: state.update({"away_mode": True, "timer_until": time.time() + duration}); save_state(); bot_msg(chat_id, f"⏱ Автоответчик включён на {format_duration(duration)}.", menu())
+            elif text.startswith("/delay"):
+                parts = text.split(maxsplit=1)
+                if len(parts) == 1:
+                    bot_msg(chat_id, f"⏳ Задержка между автоответами: {format_duration(get_reply_cooldown())}\n\nМожно выбрать кнопку ниже или написать, например:\n/delay 5m\n/delay 1h", delay_menu())
+                else:
+                    duration = parse_duration(parts[1])
+                    if parts[1].strip() == "0":
+                        duration = 0
+                    if duration is None:
+                        bot_msg(chat_id, "Формат: /delay 0, /delay 5m, /delay 30m или /delay 1h", delay_menu())
+                    else:
+                        ok, error = set_reply_cooldown(duration)
+                        if ok:
+                            reply_cooldowns.clear()
+                            bot_msg(chat_id, f"✅ Задержка установлена: {format_duration(duration)}.", menu())
+                        else:
+                            bot_msg(chat_id, f"❌ Не удалось сохранить задержку. Ошибка Supabase:\n{error}", delay_menu())
             elif text == "/status":
-                bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nПерсональных ответов: {len(custom)}\n\nСтандартный:\n{state['away_text']}", menu())
+                bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nЗадержка ответов: {format_duration(get_reply_cooldown())}\nПерсональных ответов: {len(custom)}\n\nСтандартный:\n{state['away_text']}", menu())
             elif text == "/list":
                 bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k,v in custom.items()), menu())
             elif text == "/text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\n/text Новый текст", menu())
@@ -276,10 +336,23 @@ def webhook():
             if data == "on": state.update({"away_mode": True, "timer_until": None}); save_state(); bot_msg(chat_id, "🟢 Включено.", menu())
             elif data == "off": state.update({"away_mode": False, "timer_until": None}); save_state(); bot_msg(chat_id, "🔴 Выключено.", menu())
             elif data == "timer": bot_msg(chat_id, f"⏱ Таймер: {timer_label()}", timer_menu())
+            elif data == "delay": bot_msg(chat_id, f"⏳ Задержка между автоответами: {format_duration(get_reply_cooldown())}", delay_menu())
+            elif data.startswith("d:"):
+                value = data.split(":", 1)[1]
+                if value == "help":
+                    bot_msg(chat_id, "✏️ Своя задержка\n\nНапиши команду, например:\n/delay 15m\n/delay 2h\n/delay 0 — без задержки", delay_menu())
+                else:
+                    seconds = int(value)
+                    ok, error = set_reply_cooldown(seconds)
+                    if ok:
+                        reply_cooldowns.clear()
+                        bot_msg(chat_id, f"✅ Задержка установлена: {format_duration(seconds)}.", menu())
+                    else:
+                        bot_msg(chat_id, f"❌ Не удалось сохранить задержку. Ошибка Supabase:\n{error}", delay_menu())
             elif data.startswith("t:"):
                 seconds = int(data.split(":",1)[1]); state["away_mode"] = True; state["timer_until"] = time.time()+seconds if seconds else None; save_state(); bot_msg(chat_id, "⏱ Таймер установлен.", menu())
             elif data == "back": bot_msg(chat_id, "⚙️ Управление:", menu())
-            elif data == "status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nПерсональных ответов: {len(get_custom_texts())}", menu())
+            elif data == "status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nЗадержка ответов: {format_duration(get_reply_cooldown())}\nПерсональных ответов: {len(get_custom_texts())}", menu())
             elif data == "text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\nДля изменения:\n/text Новый текст", menu())
             elif data == "list":
                 custom = get_custom_texts(); bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n"+"\n\n".join(f"ID {k}: {v}" for k,v in custom.items()), menu())
@@ -293,6 +366,7 @@ def webhook():
         sender_id = sender.get("id")
         sender_business_bot = business.get("sender_business_bot")
 
+        # Не отвечаем на собственные сообщения владельца Business-аккаунта/бота.
         is_owner_message = (
             str(sender_id) == str(state.get("owner_user_id"))
             or str((business.get("chat") or {}).get("id")) == str(state.get("owner_user_id"))
@@ -312,11 +386,11 @@ def webhook():
 
         if connection_id and chat_id and (business.get("text") or business.get("caption")):
             now = time.time()
+            cooldown = get_reply_cooldown()
             last_reply = reply_cooldowns.get(str(chat_id))
 
-            # Не отвечаем чаще одного раза в 5 минут в одном и том же чате.
-            if last_reply is not None and now - last_reply < REPLY_COOLDOWN:
-                log.info("Reply skipped by 5-minute cooldown: chat_id=%s", chat_id)
+            if last_reply is not None and now - last_reply < cooldown:
+                log.info("Reply skipped by cooldown: chat_id=%s cooldown=%ss", chat_id, cooldown)
                 return jsonify({"ok": True})
 
             custom = get_custom_texts()
@@ -324,7 +398,7 @@ def webhook():
             try:
                 business_msg(connection_id, chat_id, reply, business.get("message_id"))
                 reply_cooldowns[str(chat_id)] = now
-                log.info("Business reply sent: chat_id=%s cooldown=300s", chat_id)
+                log.info("Business reply sent: chat_id=%s cooldown=%ss", chat_id, cooldown)
             except Exception:
                 log.exception("Failed to send business reply")
 
