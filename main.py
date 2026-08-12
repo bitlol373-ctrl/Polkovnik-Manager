@@ -61,12 +61,7 @@ def save_state():
         return False
     try:
         timer = datetime.fromtimestamp(state["timer_until"], timezone.utc).isoformat() if state.get("timer_until") else None
-        data = {
-            "owner_user_id": state.get("owner_user_id"),
-            "away_mode": bool(state.get("away_mode")),
-            "away_text": state.get("away_text"),
-            "timer_until": timer,
-        }
+        data = {"owner_user_id": state.get("owner_user_id"), "away_mode": bool(state.get("away_mode")), "away_text": state.get("away_text"), "timer_until": timer}
         try:
             data["notifications_enabled"] = notifications_enabled
             supabase.table("manager_state").update(data).eq("id", 1).execute()
@@ -243,10 +238,7 @@ def setup_webhook():
         log.info("Manager bot id: %s", bot_user_id)
     except Exception:
         log.exception("Could not get Manager bot id")
-    payload = {
-        "url": f"{PUBLIC_URL}/telegram/webhook",
-        "allowed_updates": ["message", "callback_query", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
-    }
+    payload = {"url": f"{PUBLIC_URL}/telegram/webhook", "allowed_updates": ["message", "callback_query", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"]}
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
     tg("setWebhook", payload)
@@ -320,31 +312,25 @@ def webhook():
                     duration = parse_duration(parts[1])
                     if duration is None: bot_msg(chat_id, "Формат: /timer 30m, /timer 2h или /timer 1h30m", timer_menu(), keep_last=True)
                     else: state.update({"away_mode": True, "timer_until": time.time() + duration}); save_state(); bot_msg(chat_id, f"⏱ Автоответчик включён на {format_duration(duration)}.", menu(), keep_last=True)
-            elif text == "/status":
-                bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nЗадержка ответов: {delay_label()}\nУведомления: {'🟢 включены' if notifications_enabled else '🔴 выключены'}\nПерсональных ответов: {len(custom)}\n\nСтандартный:\n{state['away_text']}", menu(), keep_last=True)
+            elif text == "/status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nЗадержка ответов: {delay_label()}\nУведомления: {'🟢 включены' if notifications_enabled else '🔴 выключены'}\nПерсональных ответов: {len(custom)}\n\nСтандартный:\n{state['away_text']}", menu(), keep_last=True)
             elif text == "/delay": bot_msg(chat_id, f"⏳ Задержка между ответами: {delay_label()}", delay_menu(), keep_last=True)
             elif text.startswith("/delay "):
-                value = text[7:].strip()
-                duration = 0 if value == "0" else parse_duration(value)
+                value = text[7:].strip(); duration = 0 if value == "0" else parse_duration(value)
                 if duration is None: bot_msg(chat_id, "Формат: /delay 5m, /delay 30m, /delay 1h или /delay 0", delay_menu(), keep_last=True)
                 else:
-                    ok, error = set_reply_delay(duration)
-                    bot_msg(chat_id, f"✅ Задержка установлена: {delay_label()}" if ok else f"❌ Не удалось сохранить задержку:\n{error}", menu(), keep_last=True)
+                    ok, error = set_reply_delay(duration); bot_msg(chat_id, f"✅ Задержка установлена: {delay_label()}" if ok else f"❌ Не удалось сохранить задержку:\n{error}", menu(), keep_last=True)
             elif text == "/list": bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k, v in custom.items()), menu(), keep_last=True)
             elif text == "/text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\n/text Новый текст", menu(), keep_last=True)
             elif text.startswith("/text "):
-                new_text = text[6:].strip()
-                state["away_text"] = new_text
+                new_text = text[6:].strip(); state["away_text"] = new_text
                 if new_text and save_state(): bot_msg(chat_id, "✅ Стандартный текст сохранён.", menu(), keep_last=True)
             elif text.startswith("/set "):
                 parts = text[5:].strip().split(maxsplit=1)
                 if len(parts) == 2 and parts[0].lstrip("-").isdigit():
-                    ok, error = set_custom_text(parts[0], parts[1])
-                    bot_msg(chat_id, "✅ Персональный ответ сохранён." if ok else f"❌ Ошибка Supabase:\n{error}", menu(), keep_last=True)
+                    ok, error = set_custom_text(parts[0], parts[1]); bot_msg(chat_id, "✅ Персональный ответ сохранён." if ok else f"❌ Ошибка Supabase:\n{error}", menu(), keep_last=True)
                 else: bot_msg(chat_id, "Формат: /set ID текст", menu(), keep_last=True)
             elif text.startswith("/del "):
-                ok, error = delete_custom_text(text[5:].strip())
-                bot_msg(chat_id, "✅ Персональный ответ удалён." if ok else f"❌ Ошибка Supabase:\n{error}", menu(), keep_last=True)
+                ok, error = delete_custom_text(text[5:].strip()); bot_msg(chat_id, "✅ Персональный ответ удалён." if ok else f"❌ Ошибка Supabase:\n{error}", menu(), keep_last=True)
 
     cb = update.get("callback_query")
     if cb:
@@ -352,7 +338,10 @@ def webhook():
         chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
         data = cb.get("data")
         if str(sender_id) == str(state["owner_user_id"]) and chat_id:
-            tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
+            try:
+                tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
+            except Exception as e:
+                log.warning("answerCallbackQuery failed, continuing anyway: %s", e)
             if data == "on": state.update({"away_mode": True, "timer_until": None}); save_state(); bot_msg(chat_id, "🟢 Включено.", menu(), keep_last=True)
             elif data == "off": state.update({"away_mode": False, "timer_until": None}); save_state(); bot_msg(chat_id, "🔴 Выключено.", menu(), keep_last=True)
             elif data == "timer": bot_msg(chat_id, f"⏱ Таймер: {timer_label()}", timer_menu(), keep_last=True)
@@ -360,8 +349,7 @@ def webhook():
                 seconds = int(data.split(":", 1)[1]); state["away_mode"] = True; state["timer_until"] = time.time() + seconds if seconds else None; save_state(); bot_msg(chat_id, "⏱ Таймер установлен.", menu(), keep_last=True)
             elif data == "delay": bot_msg(chat_id, f"⏳ Задержка между ответами: {delay_label()}", delay_menu(), keep_last=True)
             elif data.startswith("d:"):
-                seconds = int(data.split(":", 1)[1]); ok, error = set_reply_delay(seconds)
-                bot_msg(chat_id, f"✅ Задержка установлена: {delay_label()}" if ok else f"❌ Не удалось сохранить:\n{error}", menu(), keep_last=True)
+                seconds = int(data.split(":", 1)[1]); ok, error = set_reply_delay(seconds); bot_msg(chat_id, f"✅ Задержка установлена: {delay_label()}" if ok else f"❌ Не удалось сохранить:\n{error}", menu(), keep_last=True)
             elif data == "delay_help": bot_msg(chat_id, "✏️ Своя задержка\n\n/delay 15m\n/delay 2h\n/delay 1h30m\n\n/delay 0 — без задержки.", delay_menu(), keep_last=True)
             elif data == "back": bot_msg(chat_id, "⚙️ Управление:", menu(), keep_last=True)
             elif data == "status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nЗадержка ответов: {delay_label()}\nУведомления: {'🟢 включены' if notifications_enabled else '🔴 выключены'}\nПерсональных ответов: {len(get_custom_texts())}", menu(), keep_last=True)
@@ -369,8 +357,7 @@ def webhook():
             elif data == "list":
                 custom = get_custom_texts(); bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k, v in custom.items()), menu(), keep_last=True)
             elif data == "set_help": bot_msg(chat_id, "👤 Персональный ответ\n\nВ этом чате отправь:\n/set ID текст", menu(), keep_last=True)
-            elif data == "notify":
-                notifications_enabled = not notifications_enabled; save_state(); bot_msg(chat_id, f"🔔 Уведомления {'включены 🟢' if notifications_enabled else 'выключены 🔴'}.", menu(), keep_last=True)
+            elif data == "notify": notifications_enabled = not notifications_enabled; save_state(); bot_msg(chat_id, f"🔔 Уведомления {'включены 🟢' if notifications_enabled else 'выключены 🔴'}.", menu(), keep_last=True)
 
     business = update.get("business_message")
     if business and timer_active():
@@ -380,44 +367,24 @@ def webhook():
         sender = business.get("from") or {}
         sender_id = sender.get("id")
         sender_business_bot = business.get("sender_business_bot")
-        is_owner = (
-            str(sender_id) == str(state.get("owner_user_id"))
-            or str(chat_id) == str(state.get("owner_user_id"))
-            or isinstance(sender_business_bot, dict)
-            or bool(sender.get("is_bot"))
-            or (bot_user_id is not None and str(sender_id) == str(bot_user_id))
-        )
+        is_owner = (str(sender_id) == str(state.get("owner_user_id")) or str(chat_id) == str(state.get("owner_user_id")) or isinstance(sender_business_bot, dict) or bool(sender.get("is_bot")) or (bot_user_id is not None and str(sender_id) == str(bot_user_id)))
         log.info("Business message: sender_id=%s owner_id=%s bot_id=%s sender_business_bot=%s is_bot=%s is_owner=%s", sender_id, state.get("owner_user_id"), bot_user_id, bool(sender_business_bot), sender.get("is_bot"), is_owner)
-        if is_owner:
-            return jsonify({"ok": True})
-
+        if is_owner: return jsonify({"ok": True})
         if connection_id and chat_id:
             mark_business_read(connection_id, chat_id)
             if notifications_enabled and state.get("owner_user_id"):
                 name = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")])) or sender.get("username") or str(chat_id)
                 note = f"📩 Новое сообщение\n\n👤 {name}\n{media_description(business)}"
-                try:
-                    bot_msg(state["owner_user_id"], note, keep_last=True)
-                except Exception:
-                    log.exception("Failed to send notification")
-
-            now = time.time()
-            last_reply = reply_cooldowns.get(str(chat_id))
-            if REPLY_COOLDOWN > 0 and last_reply is not None and now - last_reply < REPLY_COOLDOWN:
-                return jsonify({"ok": True})
-
-            custom = get_custom_texts()
-            reply = custom.get(str(chat_id), state["away_text"])
+                try: bot_msg(state["owner_user_id"], note, keep_last=True)
+                except Exception: log.exception("Failed to send notification")
+            now = time.time(); last_reply = reply_cooldowns.get(str(chat_id))
+            if REPLY_COOLDOWN > 0 and last_reply is not None and now - last_reply < REPLY_COOLDOWN: return jsonify({"ok": True})
+            custom = get_custom_texts(); reply = custom.get(str(chat_id), state["away_text"])
             try:
-                business_msg(connection_id, chat_id, reply, business.get("message_id"))
-                reply_cooldowns[str(chat_id)] = now
-            except Exception:
-                log.exception("Failed to send business reply")
-
+                business_msg(connection_id, chat_id, reply, business.get("message_id")); reply_cooldowns[str(chat_id)] = now
+            except Exception: log.exception("Failed to send business reply")
     return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
-    load_state()
-    setup_webhook()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+    load_state(); setup_webhook(); app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
