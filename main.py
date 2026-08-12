@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
 if not BOT_TOKEN:
     log.warning("TELEGRAM_BOT_TOKEN is not set")
@@ -43,12 +43,17 @@ def send_business_message(connection_id: str, chat_id: int, text: str, reply_to:
 
 def install_webhook():
     if not BOT_TOKEN or not PUBLIC_URL:
-        log.info("Webhook is not installed yet: set TELEGRAM_BOT_TOKEN and PUBLIC_URL")
+        log.info("Webhook is not installed yet: set TELEGRAM_BOT_TOKEN and PUBLIC_URL/RENDER_EXTERNAL_URL")
         return
 
     payload = {
         "url": f"{PUBLIC_URL}/telegram/webhook",
-        "allowed_updates": ["business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
+        "allowed_updates": [
+            "business_connection",
+            "business_message",
+            "edited_business_message",
+            "deleted_business_messages",
+        ],
         "drop_pending_updates": False,
     }
     if WEBHOOK_SECRET:
@@ -73,7 +78,6 @@ def telegram_webhook():
     update = request.get_json(silent=True) or {}
     log.info("Telegram update: %s", update)
 
-    # A Secretary/connected-account message arrives as business_message.
     message = update.get("business_message")
     if message:
         connection_id = message.get("business_connection_id")
@@ -82,7 +86,6 @@ def telegram_webhook():
         text = message.get("text") or message.get("caption")
 
         if connection_id and chat_id and text:
-            # Temporary test response. AI will replace this in the next step.
             try:
                 send_business_message(
                     connection_id,
