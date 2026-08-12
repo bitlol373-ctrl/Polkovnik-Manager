@@ -25,6 +25,7 @@ state = {"owner_user_id": None, "away_mode": False, "timer_until": None, "away_t
 def load_state():
     global state
     if not supabase:
+        log.error("Supabase client is unavailable")
         return
     try:
         row = supabase.table("manager_state").select("*").eq("id", 1).single().execute().data
@@ -37,42 +38,61 @@ def load_state():
                 from datetime import datetime, timezone
                 state["timer_until"] = datetime.fromisoformat(timer.replace("Z", "+00:00")).timestamp()
     except Exception:
-        log.exception("Could not load state")
+        log.exception("Could not load state from Supabase")
 
 
 def save_state():
     if not supabase:
-        return
+        log.error("Cannot save state: Supabase client unavailable")
+        return False
     try:
         from datetime import datetime, timezone
         timer = datetime.fromtimestamp(state["timer_until"], timezone.utc).isoformat() if state.get("timer_until") else None
-        supabase.table("manager_state").update({
+        result = supabase.table("manager_state").update({
             "owner_user_id": state.get("owner_user_id"),
             "away_mode": bool(state.get("away_mode")),
             "away_text": state.get("away_text"),
             "timer_until": timer,
         }).eq("id", 1).execute()
-    except Exception:
-        log.exception("Could not save state")
+        log.info("Supabase manager_state updated: %s", result.data)
+        return True
+    except Exception as e:
+        log.exception("SUPABASE WRITE ERROR (manager_state): %s", e)
+        return False
 
 
 def get_custom_texts():
     if not supabase:
+        log.error("Cannot read custom replies: Supabase unavailable")
         return {}
     try:
         rows = supabase.table("custom_replies").select("chat_id,reply_text").execute().data or []
         return {str(row["chat_id"]): row["reply_text"] for row in rows}
-    except Exception:
-        log.exception("Could not load custom replies")
+    except Exception as e:
+        log.exception("SUPABASE READ ERROR (custom_replies): %s", e)
         return {}
 
 
 def set_custom_text(chat_id, text):
-    supabase.table("custom_replies").upsert({"chat_id": int(chat_id), "reply_text": text}).execute()
+    if not supabase:
+        return False, "Supabase не подключён"
+    try:
+        result = supabase.table("custom_replies").upsert({"chat_id": int(chat_id), "reply_text": text}).execute()
+        log.info("Supabase custom reply saved: chat_id=%s result=%s", chat_id, result.data)
+        return True, None
+    except Exception as e:
+        log.exception("SUPABASE WRITE ERROR (custom_replies): %s", e)
+        return False, str(e)
 
 
 def delete_custom_text(chat_id):
-    supabase.table("custom_replies").delete().eq("chat_id", int(chat_id)).execute()
+    try:
+        result = supabase.table("custom_replies").delete().eq("chat_id", int(chat_id)).execute()
+        log.info("Supabase custom reply deleted: chat_id=%s result=%s", chat_id, result.data)
+        return True, None
+    except Exception as e:
+        log.exception("SUPABASE DELETE ERROR (custom_replies): %s", e)
+        return False, str(e)
 
 
 def timer_active():
@@ -197,13 +217,29 @@ def webhook():
                 bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k,v in custom.items()), menu())
             elif text == "/text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\n/text Новый текст", menu())
             elif text.startswith("/text "):
-                state["away_text"] = text[6:].strip(); save_state(); bot_msg(chat_id, "✅ Стандартный текст сохранён.", menu())
+                new_text = text[6:].strip()
+                if not new_text:
+                    bot_msg(chat_id, "❌ Текст не может быть пустым.", menu())
+                elif save_state():
+                    state["away_text"] = new_text
+                    if save_state():
+                        bot_msg(chat_id, "✅ Стандартный текст сохранён.", menu())
+                    else:
+                        bot_msg(chat_id, "❌ Не удалось сохранить стандартный текст. Смотри Render Logs.", menu())
             elif text.startswith("/set "):
                 parts = text[5:].strip().split(maxsplit=1)
-                if len(parts) == 2 and parts[0].lstrip("-").isdigit(): set_custom_text(parts[0], parts[1]); bot_msg(chat_id, "✅ Персональный ответ сохранён.", menu())
-                else: bot_msg(chat_id, "Формат: /set ID текст", menu())
+                if len(parts) == 2 and parts[0].lstrip("-").isdigit():
+                    ok, error = set_custom_text(parts[0], parts[1])
+                    if ok:
+                        bot_msg(chat_id, "✅ Персональный ответ сохранён.", menu())
+                    else:
+                        bot_msg(chat_id, f"❌ Не удалось сохранить. Ошибка Supabase:\n{error}", menu())
+                else:
+                    bot_msg(chat_id, "Формат: /set ID текст", menu())
             elif text.startswith("/del "):
-                target = text[5:].strip(); delete_custom_text(target); bot_msg(chat_id, "✅ Персональный ответ удалён.", menu())
+                target = text[5:].strip()
+                ok, error = delete_custom_text(target)
+                bot_msg(chat_id, "✅ Персональный ответ удалён." if ok else f"❌ Ошибка Supabase:\n{error}", menu())
 
     cb = update.get("callback_query")
     if cb:
@@ -219,7 +255,7 @@ def webhook():
                 seconds = int(data.split(":",1)[1]); state["away_mode"] = True; state["timer_until"] = time.time()+seconds if seconds else None; save_state(); bot_msg(chat_id, "⏱ Таймер установлен.", menu())
             elif data == "back": bot_msg(chat_id, "⚙️ Управление:", menu())
             elif data == "status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nПерсональных ответов: {len(get_custom_texts())}", menu())
-            elif data == "text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\n/text Новый текст", menu())
+            elif data == "text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\nДля изменения:\n/text Новый текст", menu())
             elif data == "list":
                 custom = get_custom_texts(); bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n"+"\n\n".join(f"ID {k}: {v}" for k,v in custom.items()), menu())
             elif data == "set_help": bot_msg(chat_id, "👤 Персональный ответ\n\nВ этом чате отправь:\n/set ID текст\n\nВ чат с человеком заходить не нужно.", menu())
