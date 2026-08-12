@@ -25,7 +25,7 @@ bot_user_id = None
 
 
 def load_state():
-    global state, notifications_enabled
+    global state, notifications_enabled, REPLY_COOLDOWN
     if not supabase:
         return
     try:
@@ -39,6 +39,12 @@ def load_state():
             if timer:
                 from datetime import datetime, timezone
                 state["timer_until"] = datetime.fromisoformat(timer.replace("Z", "+00:00")).timestamp()
+        try:
+            delay_row = supabase.table("custom_replies").select("reply_text").eq("chat_id", 0).maybe_single().execute().data
+            if delay_row and str(delay_row.get("reply_text", "")).isdigit():
+                REPLY_COOLDOWN = max(0, int(delay_row["reply_text"]))
+        except Exception:
+            log.warning("Could not load reply delay")
     except Exception:
         log.exception("Could not load state from Supabase")
 
@@ -66,7 +72,7 @@ def get_custom_texts():
     if not supabase:
         return {}
     try:
-        rows = supabase.table("custom_replies").select("chat_id,reply_text").execute().data or []
+        rows = supabase.table("custom_replies").select("chat_id,reply_text").neq("chat_id", 0).execute().data or []
         return {str(r["chat_id"]): r["reply_text"] for r in rows}
     except Exception:
         log.exception("SUPABASE READ ERROR (custom_replies)")
@@ -87,6 +93,23 @@ def delete_custom_text(chat_id):
         return True, None
     except Exception as e:
         return False, str(e)
+
+
+def set_reply_delay(seconds):
+    global REPLY_COOLDOWN
+    seconds = max(0, int(seconds))
+    try:
+        supabase.table("custom_replies").upsert({"chat_id": 0, "reply_text": str(seconds)}).execute()
+        REPLY_COOLDOWN = seconds
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def delay_label():
+    if REPLY_COOLDOWN <= 0:
+        return "без задержки"
+    return format_duration(REPLY_COOLDOWN)
 
 
 def timer_active():
@@ -175,10 +198,22 @@ def menu():
     return {"inline_keyboard": [
         [{"text": "🟢 Включить", "callback_data": "on"}, {"text": "🔴 Выключить", "callback_data": "off"}],
         [{"text": "⏱ Таймер", "callback_data": "timer"}, {"text": "📊 Статус", "callback_data": "status"}],
+        [{"text": "⏳ Задержка ответов", "callback_data": "delay"}],
         [{"text": "📝 Стандартный текст", "callback_data": "text"}],
         [{"text": "👤 Персональный ответ", "callback_data": "set_help"}],
         [{"text": "📋 Персональные ответы", "callback_data": "list"}],
         [{"text": "🔔 Уведомления", "callback_data": "notify"}]
+    ]}
+
+
+def delay_menu():
+    return {"inline_keyboard": [
+        [{"text": "Без задержки", "callback_data": "d:0"}],
+        [{"text": "1 мин", "callback_data": "d:60"}, {"text": "5 мин", "callback_data": "d:300"}],
+        [{"text": "10 мин", "callback_data": "d:600"}, {"text": "30 мин", "callback_data": "d:1800"}],
+        [{"text": "1 час", "callback_data": "d:3600"}],
+        [{"text": "✏️ Своя задержка", "callback_data": "delay_help"}],
+        [{"text": "⬅️ Назад", "callback_data": "back"}]
     ]}
 
 
@@ -210,7 +245,7 @@ def setup_webhook():
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "Polkovnik Manager", "away_mode": timer_active(), "timer": timer_label()})
+    return jsonify({"ok": True, "service": "Polkovnik Manager", "away_mode": timer_active(), "timer": timer_label(), "reply_delay": delay_label()})
 
 
 @app.post("/telegram/webhook")
@@ -234,10 +269,10 @@ def webhook():
         if chat_id and sender_id and text == "/start" and state["owner_user_id"] is None:
             state["owner_user_id"] = sender_id
             save_state()
-            bot_msg(chat_id, "⚙️ Polkovник Manager\n\nТы назначен владельцем. Управление автоответчиком:", menu(), keep_last=True)
+            bot_msg(chat_id, "⚙️ Polkovnik Manager\n\nТы назначен владельцем. Управление автоответчиком:", menu(), keep_last=True)
         elif chat_id and str(sender_id) == str(state["owner_user_id"]) and text:
             custom = get_custom_texts()
-            if text == "/start": bot_msg(chat_id, "⚙️ Polkovник Manager\n\nУправление автоответчиком:", menu(), keep_last=True)
+            if text == "/start": bot_msg(chat_id, "⚙️ Polkovnik Manager\n\nУправление автоответчиком:", menu(), keep_last=True)
             elif text == "/on": state.update({"away_mode": True, "timer_until": None}); save_state(); bot_msg(chat_id, "🟢 Автоответчик включён без таймера.", menu(), keep_last=True)
             elif text == "/off": state.update({"away_mode": False, "timer_until": None}); save_state(); bot_msg(chat_id, "🔴 Автоответчик выключен.", menu(), keep_last=True)
             elif text.startswith("/timer"):
@@ -247,12 +282,19 @@ def webhook():
                     duration = parse_duration(parts[1])
                     if duration is None: bot_msg(chat_id, "Формат: /timer 30m, /timer 2h или /timer 1h30m", timer_menu(), keep_last=True)
                     else: state.update({"away_mode": True, "timer_until": time.time()+duration}); save_state(); bot_msg(chat_id, f"⏱ Автоответчик включён на {format_duration(duration)}.", menu(), keep_last=True)
-            elif text == "/status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nУведомления: {'🟢 включены' if notifications_enabled else '🔴 выключены'}\nПерсональных ответов: {len(custom)}\n\nСтандартный:\n{state['away_text']}", menu(), keep_last=True)
+            elif text == "/status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nЗадержка ответов: {delay_label()}\nУведомления: {'🟢 включены' if notifications_enabled else '🔴 выключены'}\nПерсональных ответов: {len(custom)}\n\nСтандартный:\n{state['away_text']}", menu(), keep_last=True)
+            elif text == "/delay": bot_msg(chat_id, f"⏳ Задержка между ответами: {delay_label()}", delay_menu(), keep_last=True)
+            elif text.startswith("/delay "):
+                duration = parse_duration(text[7:].strip())
+                if text[7:].strip() == "0": duration = 0
+                if duration is None: bot_msg(chat_id, "Формат: /delay 5m, /delay 30m, /delay 1h или /delay 0", delay_menu(), keep_last=True)
+                else:
+                    ok, error = set_reply_delay(duration)
+                    bot_msg(chat_id, f"✅ Задержка установлена: {delay_label()}" if ok else f"❌ Не удалось сохранить задержку:\n{error}", menu(), keep_last=True)
             elif text == "/list": bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k,v in custom.items()), menu(), keep_last=True)
             elif text == "/text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\n/text Новый текст", menu(), keep_last=True)
             elif text.startswith("/text "):
-                new_text = text[6:].strip()
-                state["away_text"] = new_text
+                new_text = text[6:].strip(); state["away_text"] = new_text
                 if new_text and save_state(): bot_msg(chat_id, "✅ Стандартный текст сохранён.", menu(), keep_last=True)
             elif text.startswith("/set "):
                 parts = text[5:].strip().split(maxsplit=1)
@@ -274,8 +316,13 @@ def webhook():
             elif data == "timer": bot_msg(chat_id, f"⏱ Таймер: {timer_label()}", timer_menu(), keep_last=True)
             elif data.startswith("t:"):
                 seconds = int(data.split(":",1)[1]); state["away_mode"] = True; state["timer_until"] = time.time()+seconds if seconds else None; save_state(); bot_msg(chat_id, "⏱ Таймер установлен.", menu(), keep_last=True)
+            elif data == "delay": bot_msg(chat_id, f"⏳ Задержка между ответами: {delay_label()}", delay_menu(), keep_last=True)
+            elif data.startswith("d:"):
+                seconds = int(data.split(":",1)[1]); ok, error = set_reply_delay(seconds)
+                bot_msg(chat_id, f"✅ Задержка установлена: {delay_label()}" if ok else f"❌ Не удалось сохранить:\n{error}", menu(), keep_last=True)
+            elif data == "delay_help": bot_msg(chat_id, "✏️ Своя задержка\n\nНапиши команду, например:\n/delay 15m\n/delay 2h\n/delay 1h30m\n\n/delay 0 — без задержки.", delay_menu(), keep_last=True)
             elif data == "back": bot_msg(chat_id, "⚙️ Управление:", menu(), keep_last=True)
-            elif data == "status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nУведомления: {'🟢 включены' if notifications_enabled else '🔴 выключены'}\nПерсональных ответов: {len(get_custom_texts())}", menu(), keep_last=True)
+            elif data == "status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nЗадержка ответов: {delay_label()}\nУведомления: {'🟢 включены' if notifications_enabled else '🔴 выключены'}\nПерсональных ответов: {len(get_custom_texts())}", menu(), keep_last=True)
             elif data == "text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\nДля изменения:\n/text Новый текст", menu(), keep_last=True)
             elif data == "list":
                 custom = get_custom_texts(); bot_msg(chat_id, "📋 Нет персональных ответов." if not custom else "📋 Персональные ответы:\n\n"+"\n\n".join(f"ID {k}: {v}" for k,v in custom.items()), menu(), keep_last=True)
@@ -291,10 +338,6 @@ def webhook():
         sender = business.get("from") or {}
         sender_id = sender.get("id")
         sender_business_bot = business.get("sender_business_bot")
-
-        # Важно: исходящие сообщения, отправленные самим Manager/Business-ботом,
-        # тоже могут приходить как business_message. Их нельзя превращать в новые
-        # уведомления и автоответы, иначе получается бесконечный цикл.
         is_owner = (
             str(sender_id) == str(state.get("owner_user_id"))
             or str(chat_id) == str(state.get("owner_user_id"))
@@ -319,7 +362,7 @@ def webhook():
 
             now = time.time()
             last_reply = reply_cooldowns.get(str(chat_id))
-            if last_reply is not None and now - last_reply < REPLY_COOLDOWN:
+            if REPLY_COOLDOWN > 0 and last_reply is not None and now - last_reply < REPLY_COOLDOWN:
                 return jsonify({"ok": True})
             custom = get_custom_texts()
             reply = custom.get(str(chat_id), state["away_text"])
