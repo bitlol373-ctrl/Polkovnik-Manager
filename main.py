@@ -21,6 +21,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 state = {"owner_user_id": None, "away_mode": False, "timer_until": None, "away_text": "Привет! Я сейчас не у телефона, отвечу, как только смогу."}
 
+# Время последнего автоответа для каждого чата. Кулдаун — 5 минут.
+reply_cooldowns = {}
+REPLY_COOLDOWN = 5 * 60
+
 
 def load_state():
     global state
@@ -289,8 +293,6 @@ def webhook():
         sender_id = sender.get("id")
         sender_business_bot = business.get("sender_business_bot")
 
-        # Telegram marks messages sent by a connected business bot with sender_business_bot.
-        # Also compare IDs as strings because Supabase/Telegram may return different numeric types.
         is_owner_message = (
             str(sender_id) == str(state.get("owner_user_id"))
             or str((business.get("chat") or {}).get("id")) == str(state.get("owner_user_id"))
@@ -309,10 +311,20 @@ def webhook():
             return jsonify({"ok": True})
 
         if connection_id and chat_id and (business.get("text") or business.get("caption")):
+            now = time.time()
+            last_reply = reply_cooldowns.get(str(chat_id))
+
+            # Не отвечаем чаще одного раза в 5 минут в одном и том же чате.
+            if last_reply is not None and now - last_reply < REPLY_COOLDOWN:
+                log.info("Reply skipped by 5-minute cooldown: chat_id=%s", chat_id)
+                return jsonify({"ok": True})
+
             custom = get_custom_texts()
             reply = custom.get(str(chat_id), state["away_text"])
             try:
                 business_msg(connection_id, chat_id, reply, business.get("message_id"))
+                reply_cooldowns[str(chat_id)] = now
+                log.info("Business reply sent: chat_id=%s cooldown=300s", chat_id)
             except Exception:
                 log.exception("Failed to send business reply")
 
