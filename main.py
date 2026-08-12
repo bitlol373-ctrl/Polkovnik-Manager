@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import logging
 from flask import Flask, request, jsonify
 import httpx
@@ -13,7 +14,13 @@ PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_UR
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
 SETTINGS_FILE = "/tmp/polkovnik_settings.json"
 
-state = {"owner_user_id": None, "away_mode": False, "away_text": "Привет! Я сейчас не у телефона, отвечу, как только смогу.", "custom_texts": {}}
+state = {
+    "owner_user_id": None,
+    "away_mode": False,
+    "timer_until": None,
+    "away_text": "Привет! Я сейчас не у телефона, отвечу, как только смогу.",
+    "custom_texts": {}
+}
 
 
 def load_state():
@@ -31,6 +38,28 @@ def save_state():
             json.dump(state, f, ensure_ascii=False)
     except Exception:
         log.exception("Could not save state")
+
+
+def timer_active():
+    until = state.get("timer_until")
+    if until is not None and time.time() >= until:
+        state["away_mode"] = False
+        state["timer_until"] = None
+        save_state()
+        return False
+    return bool(state.get("away_mode"))
+
+
+def timer_label():
+    until = state.get("timer_until")
+    if not until:
+        return "без таймера"
+    left = max(0, int(until - time.time()))
+    hours, rem = divmod(left, 3600)
+    minutes = rem // 60
+    if hours:
+        return f"до окончания: {hours} ч {minutes} мин"
+    return f"до окончания: {minutes} мин"
 
 
 def tg(method, payload):
@@ -60,16 +89,30 @@ def business_msg(connection_id, chat_id, text, reply_to=None):
 def menu():
     return {"inline_keyboard": [
         [{"text": "🟢 Включить", "callback_data": "on"}, {"text": "🔴 Выключить", "callback_data": "off"}],
-        [{"text": "📊 Статус", "callback_data": "status"}, {"text": "📝 Стандартный текст", "callback_data": "text"}],
+        [{"text": "⏱ Таймер", "callback_data": "timer"}, {"text": "📊 Статус", "callback_data": "status"}],
+        [{"text": "📝 Стандартный текст", "callback_data": "text"}],
         [{"text": "👤 Персональный ответ", "callback_data": "set_help"}],
         [{"text": "📋 Персональные ответы", "callback_data": "list"}]
+    ]}
+
+
+def timer_menu():
+    return {"inline_keyboard": [
+        [{"text": "30 минут", "callback_data": "t:1800"}, {"text": "1 час", "callback_data": "t:3600"}],
+        [{"text": "2 часа", "callback_data": "t:7200"}, {"text": "4 часа", "callback_data": "t:14400"}],
+        [{"text": "8 часов", "callback_data": "t:28800"}],
+        [{"text": "♾ Без таймера", "callback_data": "t:0"}, {"text": "❌ Остановить", "callback_data": "off"}],
+        [{"text": "⬅️ Назад", "callback_data": "back"}]
     ]}
 
 
 def setup_webhook():
     if not BOT_TOKEN or not PUBLIC_URL:
         return
-    payload = {"url": f"{PUBLIC_URL}/telegram/webhook", "allowed_updates": ["message", "callback_query", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"]}
+    payload = {
+        "url": f"{PUBLIC_URL}/telegram/webhook",
+        "allowed_updates": ["message", "callback_query", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"]
+    }
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
     tg("setWebhook", payload)
@@ -77,13 +120,14 @@ def setup_webhook():
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "Polkovnik Manager", "away_mode": state["away_mode"]})
+    return jsonify({"ok": True, "service": "Polkovnik Manager", "away_mode": timer_active(), "timer": timer_label()})
 
 
 @app.post("/telegram/webhook")
 def webhook():
     if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
         return jsonify({"ok": False}), 403
+
     update = request.get_json(silent=True) or {}
     log.info("Update received: %s", update)
 
@@ -98,21 +142,43 @@ def webhook():
         chat_id = (msg.get("chat") or {}).get("id")
         text = (msg.get("text") or "").strip()
 
-        # /start is allowed only when no owner has been registered yet.
-        # This fixes the first-run problem after a deploy. After that, only the owner can control the bot.
         if chat_id and sender_id and text == "/start" and state["owner_user_id"] is None:
             state["owner_user_id"] = sender_id
             save_state()
-            bot_msg(chat_id, "⚙️ Polkovник Manager\n\nТы назначен владельцем. Управление автоответчиком:", menu())
+            bot_msg(chat_id, "⚙️ Polkovnik Manager\n\nТы назначен владельцем. Управление автоответчиком:", menu())
+
         elif chat_id and sender_id == state["owner_user_id"] and text:
             if text == "/start":
-                bot_msg(chat_id, "⚙️ Polkovник Manager\n\nУправление автоответчиком:", menu())
+                bot_msg(chat_id, "⚙️ Polkovnik Manager\n\nУправление автоответчиком:", menu())
             elif text == "/on":
-                state["away_mode"] = True; save_state(); bot_msg(chat_id, "🟢 Автоответчик включён.", menu())
+                state["away_mode"] = True
+                state["timer_until"] = None
+                save_state()
+                bot_msg(chat_id, "🟢 Автоответчик включён без таймера.", menu())
             elif text == "/off":
-                state["away_mode"] = False; save_state(); bot_msg(chat_id, "🔴 Автоответчик выключен.", menu())
+                state["away_mode"] = False
+                state["timer_until"] = None
+                save_state()
+                bot_msg(chat_id, "🔴 Автоответчик выключен.", menu())
+            elif text.startswith("/timer"):
+                parts = text.split(maxsplit=1)
+                if len(parts) == 1:
+                    bot_msg(chat_id, f"⏱ Таймер: {timer_label()}", timer_menu())
+                else:
+                    duration = parse_duration(parts[1])
+                    if duration is None:
+                        bot_msg(chat_id, "Формат: /timer 30m, /timer 2h или /timer 1h30m", timer_menu())
+                    elif duration <= 0:
+                        state["away_mode"] = False; state["timer_until"] = None; save_state()
+                        bot_msg(chat_id, "🔴 Автоответчик выключен.", menu())
+                    else:
+                        state["away_mode"] = True
+                        state["timer_until"] = time.time() + duration
+                        save_state()
+                        bot_msg(chat_id, f"⏱ Автоответчик включён на {format_duration(duration)}.", menu())
             elif text == "/status":
-                bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if state['away_mode'] else '🔴 выключен'}\nПерсональных ответов: {len(state['custom_texts'])}\n\nСтандартный:\n{state['away_text']}", menu())
+                active = timer_active()
+                bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if active else '🔴 выключен'}\nТаймер: {timer_label()}\nПерсональных ответов: {len(state['custom_texts'])}\n\nСтандартный:\n{state['away_text']}", menu())
             elif text == "/list":
                 items = state["custom_texts"]
                 bot_msg(chat_id, "📋 Персональных ответов нет." if not items else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k, v in items.items()), menu())
@@ -121,17 +187,23 @@ def webhook():
             elif text.startswith("/text "):
                 new_text = text[6:].strip()
                 if new_text:
-                    state["away_text"] = new_text; save_state(); bot_msg(chat_id, "✅ Стандартный текст сохранён.", menu())
+                    state["away_text"] = new_text
+                    save_state()
+                    bot_msg(chat_id, "✅ Стандартный текст сохранён.", menu())
             elif text.startswith("/set "):
                 parts = text[5:].strip().split(maxsplit=1)
                 if len(parts) == 2 and parts[0].lstrip("-").isdigit():
-                    state["custom_texts"][parts[0]] = parts[1]; save_state(); bot_msg(chat_id, "✅ Персональный ответ сохранён.", menu())
+                    state["custom_texts"][parts[0]] = parts[1]
+                    save_state()
+                    bot_msg(chat_id, "✅ Персональный ответ сохранён.", menu())
                 else:
                     bot_msg(chat_id, "Формат:\n/set ID текст\n\nНапример:\n/set 123456789 Я отвечу вечером.", menu())
             elif text.startswith("/del "):
                 target = text[5:].strip()
                 if target in state["custom_texts"]:
-                    del state["custom_texts"][target]; save_state(); bot_msg(chat_id, "✅ Персональный ответ удалён.", menu())
+                    del state["custom_texts"][target]
+                    save_state()
+                    bot_msg(chat_id, "✅ Персональный ответ удалён.", menu())
                 else:
                     bot_msg(chat_id, "Такого персонального ответа нет.", menu())
 
@@ -142,10 +214,24 @@ def webhook():
         data = cb.get("data")
         if sender_id == state["owner_user_id"] and chat_id:
             tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
-            if data == "on": state["away_mode"] = True; save_state(); bot_msg(chat_id, "🟢 Автоответчик включён.", menu())
-            elif data == "off": state["away_mode"] = False; save_state(); bot_msg(chat_id, "🔴 Автоответчик выключен.", menu())
-            elif data == "status": bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if state['away_mode'] else '🔴 выключен'}\nПерсональных ответов: {len(state['custom_texts'])}", menu())
-            elif data == "text": bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\nДля изменения:\n/text Новый текст", menu())
+            if data == "on":
+                state["away_mode"] = True; state["timer_until"] = None; save_state(); bot_msg(chat_id, "🟢 Автоответчик включён без таймера.", menu())
+            elif data == "off":
+                state["away_mode"] = False; state["timer_until"] = None; save_state(); bot_msg(chat_id, "🔴 Автоответчик выключен.", menu())
+            elif data == "timer":
+                bot_msg(chat_id, f"⏱ Таймер сейчас: {timer_label()}\n\nНа сколько включить автоответчик?", timer_menu())
+            elif data.startswith("t:"):
+                seconds = int(data.split(":", 1)[1])
+                if seconds == 0:
+                    state["away_mode"] = True; state["timer_until"] = None; save_state(); bot_msg(chat_id, "♾ Автоответчик включён без ограничения по времени.", menu())
+                else:
+                    state["away_mode"] = True; state["timer_until"] = time.time() + seconds; save_state(); bot_msg(chat_id, f"⏱ Автоответчик включён на {format_duration(seconds)}.", menu())
+            elif data == "back":
+                bot_msg(chat_id, "⚙️ Управление автоответчиком:", menu())
+            elif data == "status":
+                bot_msg(chat_id, f"Автоответчик: {'🟢 включён' if timer_active() else '🔴 выключен'}\nТаймер: {timer_label()}\nПерсональных ответов: {len(state['custom_texts'])}", menu())
+            elif data == "text":
+                bot_msg(chat_id, f"📝 Стандартный текст:\n{state['away_text']}\n\nДля изменения:\n/text Новый текст", menu())
             elif data == "list":
                 items = state["custom_texts"]
                 bot_msg(chat_id, "📋 Нет персональных ответов." if not items else "📋 Персональные ответы:\n\n" + "\n\n".join(f"ID {k}: {v}" for k, v in items.items()), menu())
@@ -153,7 +239,7 @@ def webhook():
                 bot_msg(chat_id, "👤 Настройка персонального ответа\n\nВ ЭТОМ чате отправь:\n/set ID текст\n\nНапример:\n/set 123456789 Не могу сейчас говорить, напишу позже.\n\nВ чат с человеком заходить не нужно.", menu())
 
     business = update.get("business_message")
-    if business and state["away_mode"]:
+    if business and timer_active():
         connection_id = business.get("business_connection_id")
         chat_id = (business.get("chat") or {}).get("id")
         if connection_id and chat_id and (business.get("text") or business.get("caption")):
@@ -164,6 +250,36 @@ def webhook():
                 log.exception("Failed to send business reply")
 
     return jsonify({"ok": True})
+
+
+def parse_duration(value):
+    value = value.strip().lower().replace(" ", "")
+    if not value:
+        return None
+    total = 0
+    num = ""
+    units = {"m": 60, "h": 3600, "d": 86400}
+    for ch in value:
+        if ch.isdigit():
+            num += ch
+        elif ch in units and num:
+            total += int(num) * units[ch]
+            num = ""
+        else:
+            return None
+    return total if not num and total > 0 else None
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days: parts.append(f"{days} д")
+    if hours: parts.append(f"{hours} ч")
+    if minutes: parts.append(f"{minutes} мин")
+    return " ".join(parts) or "меньше минуты"
 
 
 if __name__ == "__main__":
