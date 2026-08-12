@@ -21,6 +21,7 @@ reply_cooldowns = {}
 REPLY_COOLDOWN = 5 * 60
 notifications_enabled = True
 last_manager_message_id = None
+bot_user_id = None
 
 
 def load_state():
@@ -192,8 +193,15 @@ def timer_menu():
 
 
 def setup_webhook():
+    global bot_user_id
     if not BOT_TOKEN or not PUBLIC_URL:
         return
+    try:
+        me = tg("getMe", {})
+        bot_user_id = me.get("id")
+        log.info("Manager bot id: %s", bot_user_id)
+    except Exception:
+        log.exception("Could not get Manager bot id")
     payload = {"url": f"{PUBLIC_URL}/telegram/webhook", "allowed_updates": ["message", "callback_query", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"]}
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
@@ -283,17 +291,32 @@ def webhook():
         sender = business.get("from") or {}
         sender_id = sender.get("id")
         sender_business_bot = business.get("sender_business_bot")
-        is_owner = str(sender_id) == str(state.get("owner_user_id")) or str(chat_id) == str(state.get("owner_user_id")) or isinstance(sender_business_bot, dict)
+
+        # Важно: исходящие сообщения, отправленные самим Manager/Business-ботом,
+        # тоже могут приходить как business_message. Их нельзя превращать в новые
+        # уведомления и автоответы, иначе получается бесконечный цикл.
+        is_owner = (
+            str(sender_id) == str(state.get("owner_user_id"))
+            or str(chat_id) == str(state.get("owner_user_id"))
+            or isinstance(sender_business_bot, dict)
+            or bool(sender.get("is_bot"))
+            or (bot_user_id is not None and str(sender_id) == str(bot_user_id))
+        )
+        log.info("Business message: sender_id=%s owner_id=%s bot_id=%s sender_business_bot=%s is_bot=%s is_owner=%s", sender_id, state.get("owner_user_id"), bot_user_id, bool(sender_business_bot), sender.get("is_bot"), is_owner)
         if is_owner:
             return jsonify({"ok": True})
+
         if connection_id and chat_id and (business.get("text") or business.get("caption")):
             mark_business_read(connection_id, chat_id)
             if notifications_enabled and state.get("owner_user_id"):
                 name = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")])) or sender.get("username") or str(chat_id)
                 text = business.get("text") or business.get("caption") or "[медиа]"
                 note = f"📩 Новое сообщение\n\n👤 {name}\n💬 {text}"
-                try: bot_msg(state["owner_user_id"], note, keep_last=True)
-                except Exception: log.exception("Failed to send notification")
+                try:
+                    bot_msg(state["owner_user_id"], note, keep_last=True)
+                except Exception:
+                    log.exception("Failed to send notification")
+
             now = time.time()
             last_reply = reply_cooldowns.get(str(chat_id))
             if last_reply is not None and now - last_reply < REPLY_COOLDOWN:
