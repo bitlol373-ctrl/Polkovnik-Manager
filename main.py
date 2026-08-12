@@ -117,6 +117,27 @@ def timer_label():
     return f"до окончания: {minutes} мин"
 
 
+def parse_duration(value):
+    import re
+    matches = re.findall(r"(\d+)\s*([hm])", value.lower())
+    if not matches:
+        return None
+    total = 0
+    for amount, unit in matches:
+        total += int(amount) * (3600 if unit == "h" else 60)
+    return total if total > 0 else None
+
+
+def format_duration(seconds):
+    hours, rem = divmod(int(seconds), 3600)
+    minutes = rem // 60
+    if hours and minutes:
+        return f"{hours} ч {minutes} мин"
+    if hours:
+        return f"{hours} ч"
+    return f"{minutes} мин"
+
+
 def tg(method, payload):
     with httpx.Client(timeout=30) as client:
         r = client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload)
@@ -220,7 +241,7 @@ def webhook():
                 new_text = text[6:].strip()
                 if not new_text:
                     bot_msg(chat_id, "❌ Текст не может быть пустым.", menu())
-                elif save_state():
+                else:
                     state["away_text"] = new_text
                     if save_state():
                         bot_msg(chat_id, "✅ Стандартный текст сохранён.", menu())
@@ -264,31 +285,25 @@ def webhook():
     if business and timer_active():
         connection_id = business.get("business_connection_id")
         chat_id = (business.get("chat") or {}).get("id")
+        sender_id = (business.get("from") or {}).get("id")
+
+        # Не отвечаем на собственные сообщения владельца Business-аккаунта.
+        if sender_id == state["owner_user_id"]:
+            return jsonify({"ok": True})
+
         if connection_id and chat_id and (business.get("text") or business.get("caption")):
             custom = get_custom_texts()
             reply = custom.get(str(chat_id), state["away_text"])
-            try: business_msg(connection_id, chat_id, reply, business.get("message_id"))
-            except Exception: log.exception("Failed to send business reply")
+            try:
+                business_msg(connection_id, chat_id, reply, business.get("message_id"))
+            except Exception:
+                log.exception("Failed to send business reply")
+
     return jsonify({"ok": True})
 
 
-def parse_duration(value):
-    value=value.strip().lower().replace(" ",""); total=0; num=""; units={"m":60,"h":3600,"d":86400}
-    for ch in value:
-        if ch.isdigit(): num+=ch
-        elif ch in units and num: total+=int(num)*units[ch]; num=""
-        else: return None
-    return total if not num and total>0 else None
-
-
-def format_duration(seconds):
-    seconds=int(seconds); days,rem=divmod(seconds,86400); hours,rem=divmod(rem,3600); minutes=rem//60
-    parts=[]
-    if days: parts.append(f"{days} д")
-    if hours: parts.append(f"{hours} ч")
-    if minutes: parts.append(f"{minutes} мин")
-    return " ".join(parts) or "меньше минуты"
-
-
 if __name__ == "__main__":
-    load_state(); setup_webhook(); app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    load_state()
+    setup_webhook()
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
