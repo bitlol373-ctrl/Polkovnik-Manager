@@ -9,6 +9,7 @@ log = logging.getLogger("polkovnik-manager.ai")
 _ai_messages = {}
 _current_business = {}
 _pending_ai_prompt = {}
+_pending_personal_chat = set()
 
 
 def _ai_table():
@@ -16,7 +17,6 @@ def _ai_table():
 
 
 def _safe_query_data(query):
-    """Return Supabase response data or None when the client returns no response object."""
     result = query.execute()
     return getattr(result, "data", None) if result is not None else None
 
@@ -106,7 +106,7 @@ def _enhanced_menu(original):
     m = original()
     rows = m.get("inline_keyboard", [])
     if not any(any(x.get("callback_data") == "ai:menu" for x in row) for row in rows):
-        rows.append([{ "text": "🧠 ИИ-ассистент", "callback_data": "ai:menu" }])
+        rows.append([{"text": "🧠 ИИ-ассистент", "callback_data": "ai:menu"}])
     return {"inline_keyboard": rows}
 
 
@@ -131,18 +131,40 @@ def _remember_business():
             manager.bot_msg(msg["chat"]["id"], "🧠 ИИ-настройки\n\nВыбери, что хочешь настроить:", ai_main_menu(), keep_last=True)
             return jsonify({"ok": True})
 
+        if str(sender_id) in _pending_personal_chat:
+            if text.lower() in {"отмена", "cancel"}:
+                _pending_personal_chat.discard(str(sender_id))
+                manager.bot_msg(msg["chat"]["id"], "❌ Ввод chat_id отменён.", ai_main_menu(), keep_last=True)
+                return jsonify({"ok": True})
+            try:
+                target = int(text)
+                if target <= 0:
+                    raise ValueError
+            except ValueError:
+                manager.bot_msg(msg["chat"]["id"], "❌ Нужен числовой chat_id. Например: 7539776348\n\nИли напиши «отмена».", keep_last=True)
+                return jsonify({"ok": True})
+            _pending_personal_chat.discard(str(sender_id))
+            prompt_text, keyboard = ai_prompt_menu(target, "👤 Персональный промпт")
+            manager.bot_msg(msg["chat"]["id"], prompt_text, keyboard, keep_last=True)
+            return jsonify({"ok": True})
+
         pending = _pending_ai_prompt.get(str(sender_id))
         if pending is not None:
             if text.lower() in {"готово", "готов", "done"}:
                 target = pending["target"]
-                prompt = "\n".join(pending["parts"]).strip()
-                if not prompt:
+                new_text = "\n".join(pending["parts"]).strip()
+                if not new_text:
                     manager.bot_msg(msg["chat"]["id"], "❌ Промпт пустой. Отправь хотя бы одно сообщение.", keep_last=True)
                     return jsonify({"ok": True})
+                if pending.get("mode") == "append":
+                    current = get_ai_settings(target).get("prompt", "")
+                    prompt = (current.rstrip() + "\n\n" + new_text).strip() if current.strip() else new_text
+                else:
+                    prompt = new_text
                 ok, error = save_ai_settings(target, prompt=prompt)
                 _pending_ai_prompt.pop(str(sender_id), None)
                 if ok:
-                    manager.bot_msg(msg["chat"]["id"], "✅ Промпт сохранён.", ai_main_menu() if target == 0 else ai_prompt_menu(target, "👤 Персональный промпт")[1], keep_last=True)
+                    manager.bot_msg(msg["chat"]["id"], "✅ Новая часть добавлена к промпту." if pending.get("mode") == "append" else "✅ Промпт сохранён.", ai_main_menu() if target == 0 else ai_prompt_menu(target, "👤 Персональный промпт")[1], keep_last=True)
                 else:
                     manager.bot_msg(msg["chat"]["id"], f"❌ Не удалось сохранить промпт:\n{error}", keep_last=True)
                 return jsonify({"ok": True})
@@ -172,7 +194,13 @@ def _remember_business():
             text, keyboard = ai_prompt_menu(0, "🌐 Базовый промпт для всех")
             manager.bot_msg(cb_chat, text, keyboard, keep_last=True)
         elif action == "personal":
-            manager.bot_msg(cb_chat, "👤 Персональный промпт\n\nВыбери собеседника:", {"inline_keyboard": [[{"text": "➕ Выбрать из последних чатов", "callback_data": "ai:chatlist"}], [{"text": "⬅️ Назад к ИИ", "callback_data": "ai:menu:0"}]]}, keep_last=True)
+            manager.bot_msg(cb_chat, "👤 Персональный промпт\n\nВыбери способ выбора собеседника:", {"inline_keyboard": [[{"text": "📋 Выбрать из последних чатов", "callback_data": "ai:chatlist"}], [{"text": "🔢 Ввести chat_id вручную", "callback_data": "ai:manualchat"}], [{"text": "⬅️ Назад к ИИ", "callback_data": "ai:menu:0"}]]}, keep_last=True)
+        elif action == "manualchat":
+            _pending_personal_chat.add(str(cb_sender))
+            manager.bot_msg(cb_chat, "🔢 Отправь chat_id нужного собеседника.\n\nНапример: 7539776348\n\nМожно отменить командой «отмена».", {"inline_keyboard": [[{"text": "❌ Отменить", "callback_data": "ai:manualcancel"}]]}, keep_last=True)
+        elif action == "manualcancel":
+            _pending_personal_chat.discard(str(cb_sender))
+            manager.bot_msg(cb_chat, "❌ Ввод chat_id отменён.", ai_main_menu(), keep_last=True)
         elif action == "chatlist":
             chats = []
             for cid, msg_data in _current_business.items():
