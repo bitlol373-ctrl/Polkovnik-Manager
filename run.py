@@ -3,7 +3,7 @@ import os
 from flask import request, jsonify
 
 import main as manager
-from ai_service import ai_enabled, generate_reply
+from ai_service import ai_enabled, generate_reply, build_prompt
 
 log = logging.getLogger("polkovnik-manager.ai")
 _ai_messages = {}
@@ -17,7 +17,7 @@ def _ai_table():
 
 def get_ai_settings(chat_id):
     db = _ai_table()
-    defaults = {"enabled": True, "prompt": "Отвечай естественно, как обычный человек. Не используй канцелярит, не начинай ответы с «Конечно» и не повторяй шаблонные фразы.", "context_size": 10}
+    defaults = {"enabled": True, "prompt": "", "context_size": 10}
     if not db:
         return defaults
     try:
@@ -25,8 +25,30 @@ def get_ai_settings(chat_id):
         if row:
             defaults.update({k: row[k] for k in defaults if row.get(k) is not None})
     except Exception as e:
-        log.warning("AI settings read failed: %s", e)
+        log.warning("AI settings read failed for %s: %s", chat_id, e)
     return defaults
+
+
+def get_base_settings():
+    return get_ai_settings(0)
+
+
+def get_effective_prompt(chat_id, business):
+    base = get_base_settings().get("prompt", "")
+    personal = get_ai_settings(chat_id).get("prompt", "")
+    sender = business.get("from") or {}
+    name = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")])) or sender.get("username") or "собеседник"
+    username = sender.get("username") or ""
+    combined = build_prompt(personal_prompt=personal or None)
+    if base.strip():
+        # The database base prompt replaces the built-in default while keeping any per-chat override.
+        combined = base.strip()
+        if personal.strip():
+            combined += "\n\nДополнительные правила именно для этого собеседника:\n" + personal.strip()
+    return (combined
+            .replace("{name}", name)
+            .replace("{username}", username)
+            .replace("{chat_id}", str(chat_id)))
 
 
 def save_ai_settings(chat_id, **values):
@@ -41,23 +63,37 @@ def save_ai_settings(chat_id, **values):
         return False, str(e)
 
 
-def ai_menu(chat_id):
-    s = get_ai_settings(chat_id)
+def ai_menu(chat_id=None):
+    if chat_id in (None, 0):
+        s = get_base_settings()
+        title = "🌐 Базовые настройки ИИ"
+        target = 0
+    else:
+        s = get_ai_settings(chat_id)
+        title = f"👤 Настройки чата {chat_id}"
+        target = chat_id
     return {"inline_keyboard": [
-        [{"text": "🟢 ИИ включён" if s["enabled"] else "🔴 ИИ выключен", "callback_data": f"ai:toggle:{chat_id}"}],
-        [{"text": "✏️ Изменить промпт", "callback_data": f"ai:prompt:{chat_id}"}],
-        [{"text": f"💬 Контекст: {s['context_size']} сообщений", "callback_data": f"ai:context:{chat_id}"}],
-        [{"text": "👤 Переменные чата", "callback_data": f"ai:vars:{chat_id}"}],
+        [{"text": "🟢 ИИ включён" if s["enabled"] else "🔴 ИИ выключен", "callback_data": f"ai:toggle:{target}"}],
+        [{"text": "✏️ Изменить промпт", "callback_data": f"ai:prompt:{target}"}],
+        [{"text": f"💬 Контекст: {s['context_size']} сообщений", "callback_data": f"ai:context:{target}"}],
+        *([] if target == 0 else [[{"text": "🧹 Сбросить персональный промпт", "callback_data": f"ai:reset:{target}"}]]),
+        [{"text": "👤 Переменные чата", "callback_data": f"ai:vars:{target}"}],
         [{"text": "⬅️ Назад", "callback_data": "back"}],
     ]}
 
 
-def ai_status_text(chat_id):
-    s = get_ai_settings(chat_id)
-    prompt = s["prompt"]
+def ai_status_text(chat_id=None):
+    if chat_id in (None, 0):
+        s = get_base_settings()
+        title = "🌐 Базовые настройки ИИ"
+        prompt = s["prompt"] or "Используется встроенный базовый промпт."
+    else:
+        s = get_ai_settings(chat_id)
+        title = f"👤 Настройки чата {chat_id}"
+        prompt = s["prompt"] or "Не задан — используется базовый промпт."
     if len(prompt) > 350:
         prompt = prompt[:350] + "…"
-    return f"🧠 ИИ-настройки для чата {chat_id}\n\nСтатус: {'🟢 включён' if s['enabled'] else '🔴 выключен'}\nКонтекст: {s['context_size']} сообщений\n\nПромпт:\n{prompt}"
+    return f"{title}\n\nСтатус: {'🟢 включён' if s['enabled'] else '🔴 выключен'}\nКонтекст: {s['context_size']} сообщений\n\nПромпт:\n{prompt}"
 
 
 def _enhanced_menu(original, chat_id=None):
@@ -86,7 +122,10 @@ def _remember_business():
     text = (msg.get("text") or "").strip()
     if msg and text and str(sender_id) == str(owner_id):
         if text == "/ai":
-            manager.bot_msg(msg["chat"]["id"], "🧠 Чтобы настроить ИИ для конкретного человека, используй:\n/ai CHAT_ID\n\nID можно взять из уведомления о новом сообщении.", keep_last=True)
+            manager.bot_msg(msg["chat"]["id"], "🧠 ИИ-настройки\n\nВыбери, что хочешь настроить:", {"inline_keyboard": [
+                [{"text": "🌐 Базовый промпт для всех", "callback_data": "ai:menu:0"}],
+                [{"text": "👤 Настроить конкретный чат", "callback_data": "ai:select"}],
+            ]}, keep_last=True)
             return jsonify({"ok": True})
         if text.startswith("/ai "):
             target = text[4:].strip()
@@ -101,7 +140,7 @@ def _remember_business():
         if pending is not None:
             ok, error = save_ai_settings(pending, prompt=text)
             _pending_ai_prompt.pop(str(sender_id), None)
-            manager.bot_msg(msg["chat"]["id"], "✅ Промпт сохранён для выбранного чата." if ok else f"❌ Не удалось сохранить промпт:\n{error}", ai_menu(pending), keep_last=True)
+            manager.bot_msg(msg["chat"]["id"], "✅ Промпт сохранён." if ok else f"❌ Не удалось сохранить промпт:\n{error}", ai_menu(pending), keep_last=True)
             return jsonify({"ok": True})
 
     cb = update.get("callback_query") or {}
@@ -113,6 +152,9 @@ def _remember_business():
     if cb and str(cb_sender) == str(owner_id) and cb_chat and data.startswith("ai:"):
         parts = data.split(":")
         action = parts[1] if len(parts) > 1 else ""
+        if action == "select":
+            manager.bot_msg(cb_chat, "👤 Для настройки конкретного чата отправь:\n/ai CHAT_ID\n\nID можно взять из уведомления о новом сообщении.", keep_last=True)
+            return jsonify({"ok": True})
         try:
             target_chat = int(parts[2]) if len(parts) > 2 else int(cb_chat)
         except (ValueError, TypeError):
@@ -124,14 +166,18 @@ def _remember_business():
         if action == "menu":
             manager.bot_msg(cb_chat, ai_status_text(target_chat), ai_menu(target_chat), keep_last=True)
         elif action == "toggle":
-            s = get_ai_settings(target_chat)
+            s = get_base_settings() if target_chat == 0 else get_ai_settings(target_chat)
             ok, error = save_ai_settings(target_chat, enabled=not s["enabled"])
             manager.bot_msg(cb_chat, ai_status_text(target_chat) if ok else f"❌ {error}", ai_menu(target_chat), keep_last=True)
         elif action == "prompt":
             _pending_ai_prompt[str(cb_sender)] = target_chat
-            manager.bot_msg(cb_chat, f"✏️ Отправь следующим сообщением новый системный промпт для чата {target_chat}.\n\nПример:\nОтвечай естественно, коротко, с юмором и без официоза.", ai_menu(target_chat), keep_last=True)
+            label = "базовый промпт для всех чатов" if target_chat == 0 else f"персональный промпт для чата {target_chat}"
+            manager.bot_msg(cb_chat, f"✏️ Отправь следующим сообщением новый {label}.\n\nПеременные: {{name}}, {{username}}, {{chat_id}}", ai_menu(target_chat), keep_last=True)
+        elif action == "reset":
+            ok, error = save_ai_settings(target_chat, prompt="")
+            manager.bot_msg(cb_chat, "✅ Персональный промпт сброшен. Теперь используется базовый." if ok else f"❌ {error}", ai_menu(target_chat), keep_last=True)
         elif action == "context":
-            s = get_ai_settings(target_chat)
+            s = get_base_settings() if target_chat == 0 else get_ai_settings(target_chat)
             current = int(s["context_size"])
             options = [5, 10, 20, 30]
             nxt = options[(options.index(current) + 1) % len(options)] if current in options else 10
@@ -139,7 +185,7 @@ def _remember_business():
             _ai_messages.pop(str(target_chat), None)
             manager.bot_msg(cb_chat, ai_status_text(target_chat), ai_menu(target_chat), keep_last=True)
         elif action == "vars":
-            manager.bot_msg(cb_chat, "👤 Переменные для промпта\n\n{name} — имя собеседника\n{username} — username\n{chat_id} — ID чата\n\nПример:\n«Общайся с {name} максимально неформально».", ai_menu(target_chat), keep_last=True)
+            manager.bot_msg(cb_chat, "👤 Переменные\n\n{name} — имя собеседника\n{username} — username\n{chat_id} — ID чата\n\nПример:\nОбщайся с {name} максимально неформально.", ai_menu(target_chat), keep_last=True)
         return jsonify({"ok": True})
 
 
@@ -160,14 +206,10 @@ def ai_business_msg(connection_id, chat_id, text, reply_to=None):
     if not settings["enabled"]:
         return _original_business_msg(connection_id, chat_id, text, reply_to)
 
-    sender = business.get("from") or {}
-    name = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")])) or sender.get("username") or "собеседник"
-    username = sender.get("username") or ""
-    prompt = settings["prompt"].replace("{name}", name).replace("{username}", username).replace("{chat_id}", str(chat_id))
-
     history = _ai_messages.setdefault(str(chat_id), [])
     limit = max(2, int(settings["context_size"])) * 2
     history = history[-limit:]
+    prompt = get_effective_prompt(chat_id, business)
     reply = generate_reply(incoming, history=history, system_prompt=prompt)
     if not reply:
         return _original_business_msg(connection_id, chat_id, text, reply_to)
@@ -175,7 +217,7 @@ def ai_business_msg(connection_id, chat_id, text, reply_to=None):
     history.append({"role": "user", "content": incoming})
     history.append({"role": "assistant", "content": reply})
     _ai_messages[str(chat_id)] = history[-limit:]
-    log.info("AI reply generated: chat_id=%s prompt_len=%s", chat_id, len(prompt))
+    log.info("AI reply generated: chat_id=%s prompt_len=%s personal=%s", chat_id, len(prompt), bool(settings.get("prompt")))
     return _original_business_msg(connection_id, chat_id, reply, reply_to)
 
 
