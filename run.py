@@ -17,15 +17,22 @@ def _ai_table():
 
 def get_ai_settings(chat_id):
     db = _ai_table()
-    defaults = {"enabled": True, "prompt": "", "context_size": 10}
+    defaults = {"enabled": True, "prompt": "", "context_size": 10, "model_mode": "balanced"}
     if not db:
         return defaults
     try:
-        row = db.table("ai_chat_settings").select("enabled,prompt,context_size").eq("chat_id", int(chat_id)).maybe_single().execute().data
+        row = db.table("ai_chat_settings").select("enabled,prompt,context_size,model_mode").eq("chat_id", int(chat_id)).maybe_single().execute().data
         if row:
             defaults.update({k: row[k] for k in defaults if row.get(k) is not None})
     except Exception as e:
+        # Backward compatibility if model_mode has not yet been added to Supabase.
         log.warning("AI settings read failed for %s: %s", chat_id, e)
+        try:
+            row = db.table("ai_chat_settings").select("enabled,prompt,context_size").eq("chat_id", int(chat_id)).maybe_single().execute().data
+            if row:
+                defaults.update({k: row[k] for k in ("enabled", "prompt", "context_size") if row.get(k) is not None})
+        except Exception:
+            log.exception("AI settings fallback read failed for %s", chat_id)
     return defaults
 
 
@@ -59,6 +66,10 @@ def save_ai_settings(chat_id, **values):
         return False, str(e)
 
 
+def mode_label(mode):
+    return {"smart": "💎 Умный — Llama 3.3 70B", "balanced": "⚖️ Баланс — 8B + 70B", "economy": "⚡ Экономный — Llama 3.1 8B"}.get(mode, "⚖️ Баланс — 8B + 70B")
+
+
 def ai_main_menu():
     base = get_base_settings()
     return {"inline_keyboard": [
@@ -66,6 +77,7 @@ def ai_main_menu():
         [{"text": "👤 Персональный промпт", "callback_data": "ai:personal"}],
         [{"text": "🟢 ИИ включён" if base["enabled"] else "🔴 ИИ выключен", "callback_data": "ai:toggle:0"}],
         [{"text": f"💬 Контекст: {base['context_size']} сообщений", "callback_data": "ai:context:0"}],
+        [{"text": f"🧠 {mode_label(base['model_mode'])}", "callback_data": "ai:mode:0"}],
         [{"text": "⬅️ Назад", "callback_data": "back"}],
     ]}
 
@@ -129,9 +141,7 @@ def _remember_business():
 
             pending["parts"].append(text)
             count = len(pending["parts"])
-            manager.bot_msg(msg["chat"]["id"], f"📥 Часть {count} принята. Отправляй следующую часть или нажми кнопку «✅ Готово».\n\nПолучено: {sum(len(p) for p in pending['parts'])} символов.", {
-                "inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ai:done"}], [{"text": "❌ Отменить", "callback_data": "ai:cancel"}]]
-            }, keep_last=True)
+            manager.bot_msg(msg["chat"]["id"], f"📥 Часть {count} принята. Отправляй следующую часть или нажми кнопку «✅ Готово».\n\nПолучено: {sum(len(p) for p in pending['parts'])} символов.", {"inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ai:done"}], [{"text": "❌ Отменить", "callback_data": "ai:cancel"}]]}, keep_last=True)
             return jsonify({"ok": True})
 
     cb = update.get("callback_query") or {}
@@ -154,10 +164,7 @@ def _remember_business():
             text, keyboard = ai_prompt_menu(0, "🌐 Базовый промпт для всех")
             manager.bot_msg(cb_chat, text, keyboard, keep_last=True)
         elif action == "personal":
-            manager.bot_msg(cb_chat, "👤 Персональный промпт\n\nВыбери собеседника:", {"inline_keyboard": [
-                [{"text": "➕ Выбрать из последних чатов", "callback_data": "ai:chatlist"}],
-                [{"text": "⬅️ Назад к ИИ", "callback_data": "ai:menu:0"}],
-            ]}, keep_last=True)
+            manager.bot_msg(cb_chat, "👤 Персональный промпт\n\nВыбери собеседника:", {"inline_keyboard": [[{"text": "➕ Выбрать из последних чатов", "callback_data": "ai:chatlist"}], [{"text": "⬅️ Назад к ИИ", "callback_data": "ai:menu:0"}]]}, keep_last=True)
         elif action == "chatlist":
             chats = []
             for cid, msg_data in _current_business.items():
@@ -183,9 +190,7 @@ def _remember_business():
             target = int(parts[2])
             _pending_ai_prompt[str(cb_sender)] = {"target": target, "parts": []}
             label = "базовый промпт для всех чатов" if target == 0 else "персональный промпт для выбранного чата"
-            manager.bot_msg(cb_chat, f"✏️ Отправляй промпт частями.\n\nСколько угодно сообщений — я соберу их в один промпт.\nКогда закончишь, нажми «✅ Готово».\n\nРедактируется: {label}", {
-                "inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ai:done"}], [{"text": "❌ Отменить", "callback_data": "ai:cancel"}]]
-            }, keep_last=True)
+            manager.bot_msg(cb_chat, f"✏️ Отправляй промпт частями.\n\nСколько угодно сообщений — я соберу их в один промпт.\nКогда закончишь, нажми «✅ Готово».\n\nРедактируется: {label}", {"inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ai:done"}], [{"text": "❌ Отменить", "callback_data": "ai:cancel"}]]}, keep_last=True)
         elif action == "done":
             pending = _pending_ai_prompt.get(str(cb_sender))
             if not pending:
@@ -218,6 +223,14 @@ def _remember_business():
             save_ai_settings(target, context_size=nxt)
             _ai_messages.pop(str(target), None)
             manager.bot_msg(cb_chat, f"💬 Контекст: {nxt} сообщений", ai_main_menu(), keep_last=True)
+        elif action == "mode":
+            target = int(parts[2])
+            s = get_base_settings() if target == 0 else get_ai_settings(target)
+            options = ["smart", "balanced", "economy"]
+            current = s.get("model_mode", "balanced")
+            nxt = options[(options.index(current) + 1) % len(options)] if current in options else "balanced"
+            ok, error = save_ai_settings(target, model_mode=nxt)
+            manager.bot_msg(cb_chat, f"🧠 Режим: {mode_label(nxt)}" if ok else f"❌ Не удалось сохранить режим:\n{error}", ai_main_menu(), keep_last=True)
         return jsonify({"ok": True})
 
 manager.app.before_request(_remember_business)
@@ -234,11 +247,13 @@ def ai_business_msg(connection_id, chat_id, text, reply_to=None):
     settings = get_ai_settings(chat_id)
     if not settings["enabled"]:
         return _original_business_msg(connection_id, chat_id, text, reply_to)
+    base_settings = get_base_settings()
+    mode = settings.get("model_mode") or base_settings.get("model_mode") or "balanced"
     history = _ai_messages.setdefault(str(chat_id), [])
     limit = max(2, int(settings["context_size"])) * 2
     history = history[-limit:]
     prompt = get_effective_prompt(chat_id, business)
-    reply = generate_reply(incoming, history=history, system_prompt=prompt)
+    reply = generate_reply(incoming, history=history, system_prompt=prompt, mode=mode)
     if not reply:
         return _original_business_msg(connection_id, chat_id, text, reply_to)
     history.append({"role": "user", "content": incoming})
