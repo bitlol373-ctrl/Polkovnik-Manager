@@ -23,20 +23,32 @@ def ai_enabled():
     return bool(os.environ.get("GROQ_API_KEY", "").strip()) and os.environ.get("AI_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 
 
-def generate_reply(message_text, history=None, system_prompt=None):
+def get_base_prompt():
+    return os.environ.get("AI_BASE_PROMPT", DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
+
+
+def build_prompt(personal_prompt=None):
+    base = get_base_prompt()
+    personal = (personal_prompt or "").strip()
+    if not personal:
+        return base
+    return base + "\n\nДополнительные правила именно для этого собеседника:\n" + personal
+
+
+def generate_reply(message_text, history=None, system_prompt=None, personal_prompt=None):
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if not key:
         return None
 
     client = Groq(api_key=key)
-    prompt = system_prompt or DEFAULT_PROMPT
+    prompt = system_prompt or build_prompt(personal_prompt)
     messages = [{"role": "system", "content": prompt}]
     if history:
         messages.extend(history[-10:])
     messages.append({"role": "user", "content": message_text})
 
     try:
-        log.info("Generating AI reply: model=%s prompt_len=%s history=%s", os.environ.get("GROQ_MODEL", DEFAULT_MODEL), len(prompt), len(history or []))
+        log.info("Generating AI reply: model=%s prompt_len=%s history=%s personal=%s", os.environ.get("GROQ_MODEL", DEFAULT_MODEL), len(prompt), len(history or []), bool(personal_prompt))
         response = client.chat.completions.create(
             model=os.environ.get("GROQ_MODEL", DEFAULT_MODEL),
             messages=messages,
