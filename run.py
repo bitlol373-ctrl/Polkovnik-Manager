@@ -25,7 +25,6 @@ def get_ai_settings(chat_id):
         if row:
             defaults.update({k: row[k] for k in defaults if row.get(k) is not None})
     except Exception as e:
-        # Backward compatibility if model_mode has not yet been added to Supabase.
         log.warning("AI settings read failed for %s: %s", chat_id, e)
         try:
             row = db.table("ai_chat_settings").select("enabled,prompt,context_size").eq("chat_id", int(chat_id)).maybe_single().execute().data
@@ -87,7 +86,10 @@ def ai_prompt_menu(target_chat, title):
     prompt = s["prompt"] or ("Используется файл prompts/base.txt." if target_chat == 0 else "Не задан — используется базовый промпт.")
     if len(prompt) > 350:
         prompt = prompt[:350] + "…"
-    rows = [[{"text": "✏️ Изменить промпт", "callback_data": f"ai:prompt:{target_chat}"}]]
+    rows = [
+        [{"text": "✏️ Изменить промпт", "callback_data": f"ai:prompt:{target_chat}"}],
+        [{"text": "➕ Добавить часть к промпту", "callback_data": f"ai:append:{target_chat}"}],
+    ]
     if target_chat != 0:
         rows.append([{"text": "🧹 Сбросить → базовый", "callback_data": f"ai:reset:{target_chat}"}])
     rows.append([{"text": "⬅️ Назад к ИИ", "callback_data": "ai:menu:0"}])
@@ -104,6 +106,30 @@ def _enhanced_menu(original):
 
 _original_menu = manager.menu
 manager.menu = lambda: _enhanced_menu(_original_menu)
+
+
+def _start_prompt_input(user_id, target, append=False):
+    _pending_ai_prompt[str(user_id)] = {"target": target, "parts": [], "append": append}
+
+
+def _finish_prompt_input(user_id):
+    pending = _pending_ai_prompt.get(str(user_id))
+    if not pending:
+        return False, "Нет активного редактирования."
+    target = pending["target"]
+    incoming = "\n".join(pending["parts"]).strip()
+    if not incoming:
+        return False, "Промпт пустой."
+    current = get_base_settings().get("prompt", "") if target == 0 else get_ai_settings(target).get("prompt", "")
+    if pending.get("append") and current.strip():
+        prompt = current.rstrip() + "\n\n" + incoming
+    elif pending.get("append"):
+        prompt = incoming
+    else:
+        prompt = incoming
+    ok, error = save_ai_settings(target, prompt=prompt)
+    _pending_ai_prompt.pop(str(user_id), None)
+    return ok, error
 
 
 def _remember_business():
@@ -127,12 +153,7 @@ def _remember_business():
         if pending is not None:
             if text.lower() in {"готово", "готов", "done"}:
                 target = pending["target"]
-                prompt = "\n".join(pending["parts"]).strip()
-                if not prompt:
-                    manager.bot_msg(msg["chat"]["id"], "❌ Промпт пустой. Отправь хотя бы одно сообщение.", keep_last=True)
-                    return jsonify({"ok": True})
-                ok, error = save_ai_settings(target, prompt=prompt)
-                _pending_ai_prompt.pop(str(sender_id), None)
+                ok, error = _finish_prompt_input(sender_id)
                 if ok:
                     manager.bot_msg(msg["chat"]["id"], "✅ Промпт сохранён.", ai_main_menu() if target == 0 else ai_prompt_menu(target, "👤 Персональный промпт")[1], keep_last=True)
                 else:
@@ -188,25 +209,25 @@ def _remember_business():
             manager.bot_msg(cb_chat, "✅ Статус изменён." if ok else f"❌ {error}", ai_main_menu(), keep_last=True)
         elif action == "prompt":
             target = int(parts[2])
-            _pending_ai_prompt[str(cb_sender)] = {"target": target, "parts": []}
+            _start_prompt_input(cb_sender, target, append=False)
             label = "базовый промпт для всех чатов" if target == 0 else "персональный промпт для выбранного чата"
-            manager.bot_msg(cb_chat, f"✏️ Отправляй промпт частями.\n\nСколько угодно сообщений — я соберу их в один промпт.\nКогда закончишь, нажми «✅ Готово».\n\nРедактируется: {label}", {"inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ai:done"}], [{"text": "❌ Отменить", "callback_data": "ai:cancel"}]]}, keep_last=True)
+            manager.bot_msg(cb_chat, f"✏️ Отправляй новый промпт частями.\n\nСколько угодно сообщений — я соберу их в один промпт.\nКогда закончишь, нажми «✅ Готово».\n\nРедактируется: {label}", {"inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ai:done"}], [{"text": "❌ Отменить", "callback_data": "ai:cancel"}]]}, keep_last=True)
+        elif action == "append":
+            target = int(parts[2])
+            _start_prompt_input(cb_sender, target, append=True)
+            label = "базовому промпту для всех чатов" if target == 0 else "персональному промпту выбранного чата"
+            manager.bot_msg(cb_chat, f"➕ Добавление к промпту\n\nОтправляй новый текст любым количеством сообщений. Он будет ДОБАВЛЕН в конец существующего промпта, ничего старого не удаляется.\n\nДобавляется к: {label}\n\nКогда закончишь, нажми «✅ Готово».", {"inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ai:done"}], [{"text": "❌ Отменить", "callback_data": "ai:cancel"}]]}, keep_last=True)
         elif action == "done":
             pending = _pending_ai_prompt.get(str(cb_sender))
             if not pending:
                 manager.bot_msg(cb_chat, "ℹ️ Сейчас нет редактирования промпта.", ai_main_menu(), keep_last=True)
             else:
                 target = pending["target"]
-                prompt = "\n".join(pending["parts"]).strip()
-                if not prompt:
-                    manager.bot_msg(cb_chat, "❌ Ты ещё не отправил промпт.", keep_last=True)
+                ok, error = _finish_prompt_input(cb_sender)
+                if ok:
+                    manager.bot_msg(cb_chat, "✅ Промпт сохранён.", ai_main_menu() if target == 0 else ai_prompt_menu(target, "👤 Персональный промпт")[1], keep_last=True)
                 else:
-                    ok, error = save_ai_settings(target, prompt=prompt)
-                    _pending_ai_prompt.pop(str(cb_sender), None)
-                    if ok:
-                        manager.bot_msg(cb_chat, "✅ Промпт сохранён.", ai_main_menu() if target == 0 else ai_prompt_menu(target, "👤 Персональный промпт")[1], keep_last=True)
-                    else:
-                        manager.bot_msg(cb_chat, f"❌ Не удалось сохранить промпт:\n{error}", keep_last=True)
+                    manager.bot_msg(cb_chat, f"❌ Не удалось сохранить промпт:\n{error}", keep_last=True)
         elif action == "cancel":
             _pending_ai_prompt.pop(str(cb_sender), None)
             manager.bot_msg(cb_chat, "❌ Редактирование отменено.", ai_main_menu(), keep_last=True)
