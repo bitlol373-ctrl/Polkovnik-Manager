@@ -44,7 +44,7 @@ def get_effective_prompt(chat_id, business):
         combined = base.strip()
         if personal.strip():
             combined += "\n\nДополнительные правила именно для этого собеседника:\n" + personal.strip()
-    return (combined.replace("{name}", name).replace("{username}", username).replace("{chat_id}", str(chat_id)))
+    return combined.replace("{name}", name).replace("{username}", username).replace("{chat_id}", str(chat_id))
 
 
 def save_ai_settings(chat_id, **values):
@@ -72,7 +72,7 @@ def ai_main_menu():
 
 def ai_prompt_menu(target_chat, title):
     s = get_base_settings() if target_chat == 0 else get_ai_settings(target_chat)
-    prompt = s["prompt"] or ("Используется встроенный базовый промпт." if target_chat == 0 else "Не задан — используется базовый промпт.")
+    prompt = s["prompt"] or ("Используется файл prompts/base.txt." if target_chat == 0 else "Не задан — используется базовый промпт.")
     if len(prompt) > 350:
         prompt = prompt[:350] + "…"
     rows = [[{"text": "✏️ Изменить промпт", "callback_data": f"ai:prompt:{target_chat}"}]]
@@ -113,12 +113,25 @@ def _remember_business():
 
         pending = _pending_ai_prompt.get(str(sender_id))
         if pending is not None:
-            ok, error = save_ai_settings(pending, prompt=text)
-            _pending_ai_prompt.pop(str(sender_id), None)
-            if ok:
-                manager.bot_msg(msg["chat"]["id"], "✅ Промпт сохранён.", ai_main_menu() if pending == 0 else ai_prompt_menu(pending, "👤 Персональный промпт")[1], keep_last=True)
-            else:
-                manager.bot_msg(msg["chat"]["id"], f"❌ Не удалось сохранить промпт:\n{error}", keep_last=True)
+            if text.lower() in {"готово", "готов", "done"}:
+                target = pending["target"]
+                prompt = "\n".join(pending["parts"]).strip()
+                if not prompt:
+                    manager.bot_msg(msg["chat"]["id"], "❌ Промпт пустой. Отправь хотя бы одно сообщение.", keep_last=True)
+                    return jsonify({"ok": True})
+                ok, error = save_ai_settings(target, prompt=prompt)
+                _pending_ai_prompt.pop(str(sender_id), None)
+                if ok:
+                    manager.bot_msg(msg["chat"]["id"], "✅ Промпт сохранён.", ai_main_menu() if target == 0 else ai_prompt_menu(target, "👤 Персональный промпт")[1], keep_last=True)
+                else:
+                    manager.bot_msg(msg["chat"]["id"], f"❌ Не удалось сохранить промпт:\n{error}", keep_last=True)
+                return jsonify({"ok": True})
+
+            pending["parts"].append(text)
+            count = len(pending["parts"])
+            manager.bot_msg(msg["chat"]["id"], f"📥 Часть {count} принята. Отправляй следующую часть или нажми кнопку «✅ Готово».\n\nПолучено: {sum(len(p) for p in pending['parts'])} символов.", {
+                "inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ai:done"}], [{"text": "❌ Отменить", "callback_data": "ai:cancel"}]]
+            }, keep_last=True)
             return jsonify({"ok": True})
 
     cb = update.get("callback_query") or {}
@@ -141,7 +154,7 @@ def _remember_business():
             text, keyboard = ai_prompt_menu(0, "🌐 Базовый промпт для всех")
             manager.bot_msg(cb_chat, text, keyboard, keep_last=True)
         elif action == "personal":
-            manager.bot_msg(cb_chat, "👤 Персональный промпт\n\nЧтобы настроить персональный промпт, сначала выбери собеседника из списка последних чатов.", {"inline_keyboard": [
+            manager.bot_msg(cb_chat, "👤 Персональный промпт\n\nВыбери собеседника:", {"inline_keyboard": [
                 [{"text": "➕ Выбрать из последних чатов", "callback_data": "ai:chatlist"}],
                 [{"text": "⬅️ Назад к ИИ", "callback_data": "ai:menu:0"}],
             ]}, keep_last=True)
@@ -168,9 +181,30 @@ def _remember_business():
             manager.bot_msg(cb_chat, "✅ Статус изменён." if ok else f"❌ {error}", ai_main_menu(), keep_last=True)
         elif action == "prompt":
             target = int(parts[2])
-            _pending_ai_prompt[str(cb_sender)] = target
+            _pending_ai_prompt[str(cb_sender)] = {"target": target, "parts": []}
             label = "базовый промпт для всех чатов" if target == 0 else "персональный промпт для выбранного чата"
-            manager.bot_msg(cb_chat, f"✏️ Отправь следующим сообщением {label}.\n\nПеременные: {{name}}, {{username}}, {{chat_id}}", keep_last=True)
+            manager.bot_msg(cb_chat, f"✏️ Отправляй промпт частями.\n\nСколько угодно сообщений — я соберу их в один промпт.\nКогда закончишь, нажми «✅ Готово».\n\nРедактируется: {label}", {
+                "inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ai:done"}], [{"text": "❌ Отменить", "callback_data": "ai:cancel"}]]
+            }, keep_last=True)
+        elif action == "done":
+            pending = _pending_ai_prompt.get(str(cb_sender))
+            if not pending:
+                manager.bot_msg(cb_chat, "ℹ️ Сейчас нет редактирования промпта.", ai_main_menu(), keep_last=True)
+            else:
+                target = pending["target"]
+                prompt = "\n".join(pending["parts"]).strip()
+                if not prompt:
+                    manager.bot_msg(cb_chat, "❌ Ты ещё не отправил промпт.", keep_last=True)
+                else:
+                    ok, error = save_ai_settings(target, prompt=prompt)
+                    _pending_ai_prompt.pop(str(cb_sender), None)
+                    if ok:
+                        manager.bot_msg(cb_chat, "✅ Промпт сохранён.", ai_main_menu() if target == 0 else ai_prompt_menu(target, "👤 Персональный промпт")[1], keep_last=True)
+                    else:
+                        manager.bot_msg(cb_chat, f"❌ Не удалось сохранить промпт:\n{error}", keep_last=True)
+        elif action == "cancel":
+            _pending_ai_prompt.pop(str(cb_sender), None)
+            manager.bot_msg(cb_chat, "❌ Редактирование отменено.", ai_main_menu(), keep_last=True)
         elif action == "reset":
             target = int(parts[2])
             ok, error = save_ai_settings(target, prompt="")
