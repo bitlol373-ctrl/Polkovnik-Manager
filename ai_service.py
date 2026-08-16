@@ -9,6 +9,7 @@ from groq import RateLimitError
 log = logging.getLogger("polkovnik-manager.ai")
 
 DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+FAST_MODEL = os.environ.get("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
 DEFAULT_CONTEXT = max(2, int(os.environ.get("AI_CONTEXT_MESSAGES", "6")))
 _RATE_LIMIT_UNTIL = 0.0
 _FALLBACK_PROMPT = """Ты — AI-ассистент, который помогает вести обычную личную переписку.\nОтвечай естественно, живо и кратко, без канцелярита, морализаторства и шаблонных фраз.\nПо умолчанию отвечай на русском языке и не вставляй случайные слова из других языков.\nУчитывай предыдущий контекст и не выдумывай факты."""
@@ -57,11 +58,26 @@ def rate_limit_remaining():
 
 
 def _looks_like_foreign_garbage(text):
-    # Keep ordinary URLs/emails aside; detect CJK/Korean/Arabic characters in a response.
     return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af\u0600-\u06ff]", text))
 
 
-def generate_reply(message_text, history=None, system_prompt=None, personal_prompt=None):
+def choose_model(mode, message_text):
+    mode = (mode or "balanced").lower()
+    if mode == "smart":
+        return DEFAULT_MODEL
+    if mode == "economy":
+        return FAST_MODEL
+
+    # Balanced: cheap model for ordinary short messages, 70B for messages where
+    # context/reasoning is more likely to matter.
+    text = (message_text or "").strip()
+    complex_markers = ("почему", "зачем", "объясни", "как думаешь", "что думаешь", "если", "помнишь", "помнишь ли", "помоги", "сравни", "план", "почему же", "как считаешь")
+    if len(text) > 180 or text.count("?") >= 2 or any(marker in text.lower() for marker in complex_markers):
+        return DEFAULT_MODEL
+    return FAST_MODEL
+
+
+def generate_reply(message_text, history=None, system_prompt=None, personal_prompt=None, model=None, mode="balanced"):
     global _RATE_LIMIT_UNTIL
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if not key:
@@ -76,14 +92,15 @@ def generate_reply(message_text, history=None, system_prompt=None, personal_prom
     prompt = system_prompt or build_prompt(personal_prompt)
     context_limit = DEFAULT_CONTEXT
     trimmed_history = (history or [])[-context_limit:]
+    selected_model = model or choose_model(mode, message_text)
     messages = [{"role": "system", "content": prompt}]
     messages.extend(trimmed_history)
     messages.append({"role": "user", "content": message_text})
 
     try:
-        log.info("Generating AI reply: model=%s prompt_chars=%s context=%s", os.environ.get("GROQ_MODEL", DEFAULT_MODEL), len(prompt), len(trimmed_history))
+        log.info("Generating AI reply: model=%s mode=%s prompt_chars=%s context=%s", selected_model, mode, len(prompt), len(trimmed_history))
         response = client.chat.completions.create(
-            model=os.environ.get("GROQ_MODEL", DEFAULT_MODEL),
+            model=selected_model,
             messages=messages,
             temperature=0.85,
             max_tokens=220,
@@ -91,16 +108,14 @@ def generate_reply(message_text, history=None, system_prompt=None, personal_prom
         text = (response.choices[0].message.content or "").strip()
         if not text:
             return None
-
         if _looks_like_foreign_garbage(text):
             log.warning("Rejected AI response containing unexpected non-Latin script: %r", text)
             return None
-
         return text
     except RateLimitError as exc:
         wait = _retry_after_seconds(exc)
         _RATE_LIMIT_UNTIL = time.time() + wait
-        log.warning("Groq rate limit reached; cooldown set for %ss", wait)
+        log.warning("Groq rate limit reached for model=%s; cooldown set for %ss", selected_model, wait)
         return None
     except Exception:
         log.exception("Groq request failed")
