@@ -1,22 +1,23 @@
 import os
 import logging
+from pathlib import Path
 from groq import Groq
 
 log = logging.getLogger("polkovnik-manager.ai")
 
 DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-DEFAULT_PROMPT = os.environ.get(
-    "AI_SYSTEM_PROMPT",
-    """Ты — AI-ассистент, который помогает вести обычную личную переписку.
-Твоя задача — писать естественно, живо и кратко, как реальный человек.
-Не используй канцелярит, шаблонные фразы, морализаторство или лишние предупреждения.
-Не комментируй стиль речи собеседника и не проси его воздерживаться от мата или сленга.
-Если собеседник использует мат или разговорный язык, можешь спокойно использовать такой же уровень неформальности, если это соответствует контексту.
-Не начинай ответы с «Конечно», «Разумеется», «Понимаю» и подобных шаблонных вступлений.
-Не выдумывай факты, встречи, обещания или действия от имени владельца.
-Если вопрос требует решения, которого у тебя нет, коротко скажи, что владелец ответит позже.
-Не упоминай, что ты ИИ или бот, если это не требуется контекстом.""",
-)
+_FALLBACK_PROMPT = """Ты — AI-ассистент, который помогает вести обычную личную переписку.\nОтвечай естественно, живо и кратко, без канцелярита, морализаторства и шаблонных фраз.\nПо умолчанию отвечай на русском языке и не вставляй случайные слова из других языков.\nУчитывай предыдущий контекст и не выдумывай факты."""
+
+
+def _load_file_prompt():
+    path = Path(__file__).resolve().parent / "prompts" / "base.txt"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except Exception:
+        log.exception("Failed to load prompts/base.txt")
+    return _FALLBACK_PROMPT
 
 
 def ai_enabled():
@@ -24,7 +25,8 @@ def ai_enabled():
 
 
 def get_base_prompt():
-    return os.environ.get("AI_BASE_PROMPT", DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
+    # AI_BASE_PROMPT remains available as an environment-variable override.
+    return os.environ.get("AI_BASE_PROMPT", "").strip() or _load_file_prompt()
 
 
 def build_prompt(personal_prompt=None):
